@@ -1,0 +1,26 @@
+$ make test
+tests/test_agent.kc
+  ok   test_td_error_matches_reference_double
+  ok   test_plain_dqn_uses_max
+  ok   test_learning_reduces_loss_on_fixed_batch
+  ok   test_loss_only_counts_the_taken_action
+  ok   test_importance_weights_scale_the_error
+  ok   test_soft_and_hard_target_updates
+  ok   test_save_and_load_round_trip
+  ok   test_one_network_drives_many_cars
+  ok   test_epsilon_one_explores_every_action
+tests/test_car.kc
+  ok   test_action_decoding
+  ok   test_accelerates_to_a_sensible_top_speed
+  ok   test_braking_distance
+  ok   test_reverse_gear
+  ok   test_braking_never_reverses_the_car_by_itself
+  ok   test_tyre_grip_limits_cornering
+  ok   test_handbrake_breaks_the_rear_loose
+  ok   test_drift_is_detected
+  ok   test_steering_is_rate_limited
+  ok   test_soft_wall_pushes_back_and_slows
+  ...
+  ok   test_finished_cars_leave_the_traffic
+  ok   test_respawn_finds_a_clear_spot
+67 passed, 0 failed  (2399 ms)

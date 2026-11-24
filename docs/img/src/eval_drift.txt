@@ -1,0 +1,12 @@
+train tracks [1, 2, 3, 4, 5, 6, 7, 8]: 96 laps
+  mean progress   99.3 %
+  laps completed  98 %   (wrecked 0 %)
+  car contacts    0.12 per run    wall scrapes 0.2 per run
+  drifting        53.5 % of the time    reversing 0.2 %
+  mean speed      7.5 m/s    mean lap time 53.0 s
+unseen test tracks [101, 102, 103]: 36 laps
+  mean progress   100.0 %
+  laps completed  100 %   (wrecked 0 %)
+  car contacts    0.00 per run    wall scrapes 0.3 per run
+  drifting        53.7 % of the time    reversing 0.0 %
+  mean speed      7.5 m/s    mean lap time 52.9 s

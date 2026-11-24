@@ -1,0 +1,14 @@
+$ make eval
+AI (shared network):
+train tracks [1, 2, 3, 4, 5, 6, 7, 8]: 96 laps
+  mean progress   100.0 %
+  laps completed  100 %   (wrecked 0 %)
+  car contacts    0.83 per run    wall scrapes 0.2 per run
+  drifting        0.2 % of the time    reversing 0.1 %
+  mean speed      14.1 m/s    mean lap time 28.2 s
+unseen test tracks [101, 102, 103]: 36 laps
+  mean progress   100.0 %
+  laps completed  100 %   (wrecked 0 %)
+  car contacts    0.00 per run    wall scrapes 0.4 per run
+  drifting        0.4 % of the time    reversing 0.0 %
+  mean speed      13.9 m/s    mean lap time 28.4 s

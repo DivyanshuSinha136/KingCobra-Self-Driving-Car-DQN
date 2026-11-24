@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="170" viewBox="0 0 1280 170" role="img" aria-label="Results: 100 percent of laps completed on unseen tracks at 14.1 metres per second, 21004 parameters, 1.7 minutes of training">
+<defs><linearGradient id="rs" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#131c26"/><stop offset="1" stop-color="#0e151d"/></linearGradient></defs>
+<g transform="translate(2 0)"><rect x="0.5" y="0.5" width="304" height="168" rx="16" fill="url(#rs)" stroke="#2a3a4b"/>
+  <rect x="24" y="26" width="30" height="4" rx="2" fill="#22d3ee"/>
+  <text x="24" y="92" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="52" font-weight="700" fill="#22d3ee">100%<animate attributeName="opacity" values="0;1" dur="0.6s" begin="0s" fill="freeze"/></text>
+  <text x="24" y="122" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#d3deea" letter-spacing="1.2">LAPS COMPLETED</text>
+  <text x="24" y="148" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" fill="#7d8ea0">24 laps on 3 unseen tracks</text></g><g transform="translate(324 0)"><rect x="0.5" y="0.5" width="304" height="168" rx="16" fill="url(#rs)" stroke="#2a3a4b"/>
+  <rect x="24" y="26" width="30" height="4" rx="2" fill="#34d399"/>
+  <text x="24" y="92" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="52" font-weight="700" fill="#34d399">14.1 m/s<animate attributeName="opacity" values="0;1" dur="0.6s" begin="0.15s" fill="freeze"/></text>
+  <text x="24" y="122" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#d3deea" letter-spacing="1.2">MEAN SPEED</text>
+  <text x="24" y="148" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" fill="#7d8ea0">lap time 28.2 s · top speed 22 m/s</text></g><g transform="translate(646 0)"><rect x="0.5" y="0.5" width="304" height="168" rx="16" fill="url(#rs)" stroke="#2a3a4b"/>
+  <rect x="24" y="26" width="30" height="4" rx="2" fill="#a78bfa"/>
+  <text x="24" y="92" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="52" font-weight="700" fill="#a78bfa">21.0k<animate attributeName="opacity" values="0;1" dur="0.6s" begin="0.3s" fill="freeze"/></text>
+  <text x="24" y="122" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#d3deea" letter-spacing="1.2">PARAMETERS</text>
+  <text x="24" y="148" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" fill="#7d8ea0">one network drives every car</text></g><g transform="translate(968 0)"><rect x="0.5" y="0.5" width="304" height="168" rx="16" fill="url(#rs)" stroke="#2a3a4b"/>
+  <rect x="24" y="26" width="30" height="4" rx="2" fill="#fbbf24"/>
+  <text x="24" y="92" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="52" font-weight="700" fill="#fbbf24">1.7 min<animate attributeName="opacity" values="0;1" dur="0.6s" begin="0.44999999999999996s" fill="freeze"/></text>
+  <text x="24" y="122" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#d3deea" letter-spacing="1.2">TRAINING TIME</text>
+  <text x="24" y="148" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" fill="#7d8ea0">90 episodes × 4 cars · 1 CPU core</text></g>
+</svg>

@@ -1,0 +1,13 @@
+(hand-written baseline driver, no learning)
+train tracks [1, 2, 3, 4, 5, 6, 7, 8]: 96 laps
+  mean progress   96.2 %
+  laps completed  88 %   (wrecked 12 %)
+  car contacts    1.40 per run    wall scrapes 2.2 per run
+  drifting        2.8 % of the time    reversing 0.0 %
+  mean speed      12.9 m/s    mean lap time 30.4 s
+unseen test tracks [101, 102, 103]: 36 laps
+  mean progress   98.8 %
+  laps completed  92 %   (wrecked 8 %)
+  car contacts    1.11 per run    wall scrapes 1.2 per run
+  drifting        2.2 % of the time    reversing 0.0 %
+  mean speed      13.2 m/s    mean lap time 29.9 s
