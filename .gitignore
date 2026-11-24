@@ -1,0 +1,14 @@
+# local training runs and scratch models (the shipped models are tracked)
+models/*
+!models/driver_ddqn.kcnn
+!models/driver_ddqn.json
+!models/driver_ddqn.metrics.json
+!models/drifter_ddqn.kcnn
+!models/drifter_ddqn.json
+!models/drifter_ddqn.metrics.json
+!models/.gitkeep
+*.tmp
+*.kcnative.so
+*.log
+.DS_Store
+node_modules/
