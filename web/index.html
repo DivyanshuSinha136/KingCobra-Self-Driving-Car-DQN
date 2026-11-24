@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="Self-driving cars trained with one shared Double DQN, written in KingCobra. Watch traffic, take the wheel, drift, reverse, and inspect what the network sees.">
+<title>Self-Driving Car DQN · KingCobra</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+      <rect x="2" y="2" width="28" height="28" rx="8" class="logo-bg"/>
+      <rect x="9" y="11" width="14" height="10" rx="3.5" class="logo-car"/>
+      <rect x="17" y="13" width="4" height="6" rx="1.5" class="logo-glass"/>
+      <path d="M5 26h6M21 26h6" class="logo-road"/>
+    </svg>
+    <div>
+      <h1>Self-Driving Car DQN</h1>
+      <p class="tagline">One shared Double DQN drives every car · trained and served by <span class="accent">KingCobra</span></p>
+    </div>
+  </div>
+  <div class="top-right">
+    <span id="modelName" class="pill pill-muted" title="Loaded model">model …</span>
+    <span id="conn" class="pill pill-off" role="status" aria-live="polite">connecting…</span>
+  </div>
+</header>
+
+<main class="grid">
+
+  <!-- ───────────── track ───────────── -->
+  <section class="card board-card" aria-labelledby="boardTitle">
+    <div class="card-head">
+      <h2 id="boardTitle">Track</h2>
+      <div class="seg" role="group" aria-label="Who drives the ego car">
+        <button id="modeAi" class="seg-btn is-on" aria-pressed="true" title="The network drives the cyan car (M)">AI</button>
+        <button id="modeHuman" class="seg-btn" aria-pressed="false" title="You drive the cyan car (M)">You</button>
+      </div>
+    </div>
+
+    <div class="stage">
+      <canvas id="road" width="960" height="600" role="img" aria-label="Top-down view of the track with cars"></canvas>
+      <div class="hud" aria-live="off">
+        <div class="speedo"><span id="kmh">0</span><small>km/h</small></div>
+        <div class="gear" id="gear">D</div>
+        <span id="badgeDrift" class="badge badge-drift is-hidden">DRIFT</span>
+        <span id="badgeRev" class="badge badge-rev is-hidden">REVERSE</span>
+        <span id="badgeScrape" class="badge badge-warn is-hidden">WALL</span>
+      </div>
+      <div class="steer-ind" aria-hidden="true"><div id="steerKnob" class="steer-knob"></div></div>
+      <div id="overlay" class="overlay is-hidden" role="dialog" aria-live="assertive">
+        <h3 id="overlayTitle">Lap complete</h3>
+        <p id="overlayText"></p>
+        <button id="overlayBtn" class="btn btn-primary">Drive again</button>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button id="btnPlay" class="btn btn-primary" title="Play / pause (Space in AI mode)">▶ Play</button>
+      <button id="btnStep" class="btn" title="Advance one tick (N)">Step</button>
+      <button id="btnReset" class="btn" title="New run (R)">Reset</button>
+      <button id="btnCam" class="btn" title="Overview / chase camera (C)">Camera: overview</button>
+      <label class="field" title="Which road to drive on">
+        <span>Track</span>
+        <select id="trackSel" aria-label="Track"></select>
+      </label>
+    </div>
+    <div class="controls controls-2">
+      <label class="speed" title="Number of NPC cars driven by the same network">
+        <span>NPC cars</span>
+        <input id="npcs" type="range" min="0" max="7" step="1" value="4" aria-label="Number of NPC cars">
+        <output id="npcsOut">4</output>
+      </label>
+      <label class="speed" title="Simulation speed ( [ and ] )">
+        <span>Speed</span>
+        <input id="speed" type="range" min="1" max="40" step="1" value="10" aria-label="Simulation ticks per second">
+        <output id="speedOut">1.0×</output>
+      </label>
+      <label class="field field-inline" title="Which trained network drives the AI cars (the ego car in AI mode and every NPC)">
+        <span>Driver</span>
+        <select id="modelSel" aria-label="Driver model"></select>
+      </label>
+      <label class="check"><input id="autoRestart" type="checkbox" checked> Auto-restart ego</label>
+    </div>
+    <p class="hint">
+      <b>AI</b> <kbd>Space</kbd> play/pause · <kbd>N</kbd> step · <kbd>R</kbd> reset · <kbd>M</kbd> AI/You · <kbd>C</kbd> camera · <kbd>[</kbd><kbd>]</kbd> speed ·
+      <b>You</b> <kbd>↑</kbd> gas · <kbd>↓</kbd> brake, then reverse · <kbd>←</kbd><kbd>→</kbd> steer · <kbd>Space</kbd> handbrake (drift!) — or <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>
+    </p>
+  </section>
+
+  <!-- ───────────── right column ───────────── -->
+  <aside class="col">
+
+    <section class="card" aria-labelledby="telTitle">
+      <div class="card-head"><h2 id="telTitle">Telemetry · ego car</h2><span id="status" class="tag">ready</span></div>
+      <dl class="facts facts-3">
+        <div><dt>Speed</dt><dd id="tSpeed">0.0 m/s</dd></div>
+        <div><dt>Slip angle</dt><dd id="tSlip">0°</dd></div>
+        <div><dt>Yaw rate</dt><dd id="tYaw">0.00 rad/s</dd></div>
+        <div><dt>Lap progress</dt><dd id="tProg">0.0 %</dd></div>
+        <div><dt>Run time</dt><dd id="tTime">0.0 s</dd></div>
+        <div><dt>Offset</dt><dd id="tLat">0.0 m</dd></div>
+        <div><dt>Wall scrapes</dt><dd id="tScr">0</dd></div>
+        <div><dt>Car contacts</dt><dd id="tHit">0</dd></div>
+        <div><dt>Drift time</dt><dd id="tDrift">0.0 s</dd></div>
+      </dl>
+      <div class="lapbar" aria-hidden="true"><div id="lapFill" class="lapfill"></div></div>
+      <dl class="facts facts-3 facts-tight">
+        <div><dt>Laps</dt><dd id="sLaps">0</dd></div>
+        <div><dt>Best lap</dt><dd id="sBest">—</dd></div>
+        <div><dt>Runs</dt><dd id="sRuns">0</dd></div>
+      </dl>
+    </section>
+
+    <section class="card" aria-labelledby="netTitle">
+      <div class="card-head"><h2 id="netTitle">One network, many drivers</h2><span class="tag" id="netTag">shared</span></div>
+      <div class="netviz">
+        <div class="netcol" id="obsCol"></div>
+        <div class="netcore"><div class="netbox">Shared<br>KingCobra<br>NN</div><div class="netsub">one set of weights<br><span id="netShape"></span></div></div>
+        <div class="netcol" id="actCol"></div>
+      </div>
+      <p class="muted small">Every tick each car builds its own observation; all of them go through the <em>same</em> network in one batched forward pass, and observation <em>i</em> becomes action <em>i</em>.</p>
+    </section>
+
+    <section class="card" aria-labelledby="qTitle">
+      <div class="card-head"><h2 id="qTitle">What the network wants · ego</h2><span id="policy" class="tag">—</span></div>
+      <div class="qgrid" id="qgrid"></div>
+      <p class="muted small">Q(s, a) for the 12 actions: steering (rows) × pedal (columns). The outlined cell is the greedy choice.</p>
+    </section>
+
+    <section class="card" aria-labelledby="inTitle">
+      <details id="featDetails" open>
+        <summary><h2 id="inTitle">What the network sees</h2><span class="muted small" id="featCount"></span></summary>
+        <div id="features" class="features"></div>
+      </details>
+    </section>
+
+  </aside>
+
+  <!-- ───────────── training curves ───────────── -->
+  <section class="card wide" aria-labelledby="curveTitle">
+    <div class="card-head">
+      <h2 id="curveTitle">Training curves</h2>
+      <div class="legend" id="legend">
+        <span class="lg lg-eval">validation laps completed</span>
+        <span class="lg lg-prog">validation progress</span>
+        <span class="lg lg-train">training progress (50-car avg)</span>
+        <span class="lg lg-eps">epsilon</span>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="curve" width="900" height="300" role="img" aria-label="Training curves"></canvas>
+      <div id="tip" class="tip is-hidden"></div>
+      <p id="curveEmpty" class="muted empty is-hidden">No training metrics found. Run <code>make train</code>.</p>
+    </div>
+  </section>
+
+  <!-- ───────────── model + benchmark ───────────── -->
+  <section class="card" aria-labelledby="modelTitle">
+    <div class="card-head"><h2 id="modelTitle">Model card</h2></div>
+    <dl class="facts" id="modelFacts"></dl>
+    <details class="cfg">
+      <summary>Hyper-parameters</summary>
+      <pre id="cfgDump" class="code"></pre>
+    </details>
+  </section>
+
+  <section class="card" aria-labelledby="benchTitle">
+    <div class="card-head">
+      <h2 id="benchTitle">Benchmark · AI vs hand-written driver</h2>
+      <div class="bench-ctl">
+        <select id="benchGroup" aria-label="Which tracks">
+          <option value="test" selected>unseen test tracks</option>
+          <option value="val">validation tracks</option>
+          <option value="train">training tracks</option>
+        </select>
+        <button id="btnBench" class="btn">Run</button>
+      </div>
+    </div>
+    <p id="benchHint" class="muted small">Races a pack of cars with the shared network and with a rule-based driver on the same roads and starts.</p>
+    <div id="benchOut" class="is-hidden">
+      <div class="cmp-head"><span></span><span class="c-ai">AI</span><span class="c-base">rule-based</span></div>
+      <div id="cmpRows" class="cmp"></div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <span>Written entirely in <a href="https://github.com/DivyanshuSinha136/KingCobra">KingCobra</a> — physics, traffic, replay buffer, Double DQN, HTTP server.</span>
+  <span class="muted">MIT licensed</span>
+</footer>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script src="/static/app.js" defer></script>
+</body>
+</html>

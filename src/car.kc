@@ -1,0 +1,258 @@
+// car.kc - one car: a dynamic bicycle model with tyre slip, a handbrake (drift) and a reverse gear, plus lidar to the road.
+//
+// World units are metres, seconds and newtons; x points right, y up, headings are counter-clockwise from +x. The car
+// state is its pose (x, y, theta) and its velocity in the *body* frame: vx forward (negative = reversing), vy to the left,
+// and the yaw rate omega. One `step` is DT = 0.1 s, integrated as 4 sub-steps of 25 ms.
+//
+// Tyres: the lateral force of each axle is linear in the slip angle until it saturates at mu * load, and it shares that
+// budget with the longitudinal force (a friction circle). So a car that brakes hard in a bend understeers, a car that
+// floors it in a bend runs wide, and the *handbrake* locks the rear wheels (small friction budget): the
+// rear lets go, the car rotates and slides - a drift. The throttle pedal has a reverse gear: "brake / reverse" brakes
+// while moving forward and, once stopped, drives backwards.
+//
+// Actions are (steer, pedal) pairs:   action = steer_index * 4 + pedal_index
+//     steer_index  0 = left   1 = straight   2 = right
+//     pedal_index  0 = gas    1 = coast      2 = brake / reverse     3 = handbrake
+import "util.kc" as util;
+import "track.kc" as track;
+
+let DT = 0.1;
+let SUBSTEPS = 4;
+let MASS = 1200.0;
+let INERTIA = 1700.0;
+let A_FRONT = 1.2;                 // centre of gravity to the front axle, m
+let A_REAR = 1.4;                  // ... to the rear axle
+let WHEELBASE = 2.6;
+let GRAVITY = 9.81;
+let MU = 0.85;                     // tyre friction coefficient
+let HANDBRAKE_MU = 0.38;           // rear friction left with the handbrake on
+let C_STIFF = 48000.0;             // cornering stiffness per axle, N/rad
+let ENGINE = 5200.0;               // peak driving force (all-wheel drive, split 50/50), N
+let REVERSE_ENGINE = 2600.0;
+let BRAKE_FORCE = 9000.0;          // total, 60 % front / 40 % rear
+let HANDBRAKE_FORCE = 3000.0;
+let V_MAX = 22.0;                  // forward speed at which the engine force has faded to zero
+let V_REVERSE = 6.0;
+let MAX_STEER = 0.42;
+let STEER_RATE = 2.2;
+let HALF_LEN = 2.1;
+let HALF_WID = 0.95;
+let N_ACTIONS = 12;
+let PEDALS = ["gas", "coast", "brake/reverse", "handbrake"];
+let ACTION_NAMES = [];
+for (s in ["left", "straight", "right"]) { for (p in PEDALS) { ACTION_NAMES.push(s + " + " + p); } }
+
+let RAY_ANGLES = [1.5708, 1.0472, 0.5236, 0.0, -0.5236, -1.0472, -1.5708];   // left ... right, radians from the heading
+let RAY_RANGE = 40.0;
+let CURV_LOOK = [10.0, 25.0];
+
+fn steer_of(action: int) -> float {
+    let si = int(action / 4);
+    if (si == 0) { return 1.0; }
+    if (si == 2) { return -1.0; }
+    return 0.0;
+}
+
+fn pedal_of(action: int) -> int { return action % 4; }
+
+fn sgn(x: float) -> float {
+    if (x > 0.0) { return 1.0; }
+    if (x < 0.0) { return -1.0; }
+    return 0.0;
+}
+
+/// Distance along a ray to the road edge, in metres (RAY_RANGE if it is further away).
+fn ray_distance(t: object, x: float, y: float, ang: float) -> float {
+    let dx = cos(ang);
+    let dy = sin(ang);
+    var d = 2.0;
+    var last_ok = 0.0;
+    while (d <= RAY_RANGE) {
+        if (!track.on_road(t, x + dx * d, y + dy * d)) {
+            var lo = last_ok;
+            var hi = d;
+            for (k in 0..4) {
+                let mid = (lo + hi) * 0.5;
+                if (track.on_road(t, x + dx * mid, y + dy * mid)) { lo = mid; } else { hi = mid; }
+            }
+            return (lo + hi) * 0.5;
+        }
+        last_ok = d;
+        d += 2.0;
+    }
+    return RAY_RANGE;
+}
+
+/// A car standing on the centre line at sample `start`, aligned with the road, rolling forward at `speed` m/s.
+fn new_car(t: object, start: int = 0, speed: float = 3.0, id: int = 0, max_steps: int = 1500, stuck_steps: int = 40) -> object {
+    let c = {
+        id: id, track: t, x: t["px"][start], y: t["py"][start], theta: t["ang"][start], vx: speed, vy: 0.0, omega: 0.0, steer: 0.0,
+        idx: start, start: start, progress: 0.0, distance: 0.0, steps: 0, done: false, cause: "", still: 0,
+        rays: [], car_rays: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0], lateral: 0.0, heading_err: 0.0, scrapes: 0, hits: 0, scraped: false, hit: false,
+        action: 4, max_steps: max_steps, stuck_steps: stuck_steps, slip: 0.0, drifting: false, settled: false
+    };
+    sense_road(c);
+    return c;
+}
+
+/// Sub-step the dynamics for one tick under `action`.
+fn drive(c: object, action: int) {
+    // steering is rate limited
+    let target = steer_of(action) * MAX_STEER;
+    var dsteer = target - c["steer"];
+    let lim = STEER_RATE * DT;
+    if (dsteer > lim) { dsteer = lim; }
+    if (dsteer < -lim) { dsteer = -lim; }
+    c["steer"] += dsteer;
+    c["action"] = action;
+    let pedal = pedal_of(action);
+    let h = DT / SUBSTEPS;
+    let nf = MASS * GRAVITY * A_REAR / WHEELBASE;      // static axle loads
+    let nr = MASS * GRAVITY * A_FRONT / WHEELBASE;
+    let delta = c["steer"];
+    let cd = cos(delta);
+    let sd = sin(delta);
+    var vx = c["vx"];
+    var vy = c["vy"];
+    var w = c["omega"];
+    var th = c["theta"];
+    var x = c["x"];
+    var y = c["y"];
+
+    for (k in 0..SUBSTEPS) {
+        let dir = (vx >= 0.0 ? 1.0 : -1.0);
+        let den = (abs(vx) > 1.2 ? abs(vx) : 1.2);
+        let af = atan((vy + A_FRONT * w) / den) - delta * dir;
+        let ar = atan((vy - A_REAR * w) / den);
+
+        // pedals -> longitudinal forces (front, rear)
+        var fxf = 0.0;
+        var fxr = 0.0;
+        var mur = MU;
+        if (pedal == 0) {
+            let f = ENGINE * (1.0 - (vx > 0.0 ? vx : 0.0) / V_MAX);
+            if (f > 0.0) { fxf = f * 0.5; fxr = f * 0.5; }
+        } else if (pedal == 2) {
+            if (vx > 0.6) {
+                fxf = -BRAKE_FORCE * 0.6;
+                fxr = -BRAKE_FORCE * 0.4;
+            } else {
+                let f = REVERSE_ENGINE * (1.0 - (-vx) / V_REVERSE);
+                if (f > 0.0) { fxf = -f * 0.5; fxr = -f * 0.5; }
+            }
+        } else if (pedal == 3) {
+            fxr = -HANDBRAKE_FORCE * sgn(vx);
+            mur = HANDBRAKE_MU;
+        }
+        // the tyres cannot give more than mu * load in total
+        let capf = MU * nf;
+        let capr = mur * nr;
+        if (fxf > capf) { fxf = capf; }
+        if (fxf < -capf) { fxf = -capf; }
+        if (fxr > capr * 0.98) { fxr = capr * 0.98; }
+        if (fxr < -capr * 0.98) { fxr = -capr * 0.98; }
+        let lat_f = sqrt(capf * capf - fxf * fxf);
+        let lat_r = sqrt(capr * capr - fxr * fxr);
+        var fyf = -C_STIFF * af;
+        var fyr = -C_STIFF * ar;
+        if (fyf > lat_f) { fyf = lat_f; }
+        if (fyf < -lat_f) { fyf = -lat_f; }
+        if (fyr > lat_r) { fyr = lat_r; }
+        if (fyr < -lat_r) { fyr = -lat_r; }
+        // rolling resistance and drag
+        let fres = -sgn(vx) * (150.0 * (abs(vx) < 1.0 ? abs(vx) : 1.0) + 0.45 * vx * vx);
+
+        let fx = fxr + fxf * cd - fyf * sd + fres;
+        let fy = fyr + fyf * cd + fxf * sd;
+        let vx_old = vx;
+        vx += (fx / MASS + vy * w) * h;
+        vy += (fy / MASS - vx * w) * h;
+        w += (A_FRONT * (fyf * cd + fxf * sd) - A_REAR * fyr) / INERTIA * h;
+        // braking stops the car, it does not push it backwards
+        if (pedal == 2 && vx_old > 0.0 && vx < 0.0) { vx = 0.0; }
+        if (pedal == 3 && vx_old * vx < 0.0) { vx = 0.0; }
+        // static friction: a (nearly) stopped car does not creep sideways or spin
+        if (abs(vx) < 2.0 && pedal != 0) {
+            let damp = 1.0 - 8.0 * h * (1.0 - abs(vx) / 2.0);
+            vy = vy * damp;
+            w = w * damp;
+        }
+        th += w * h;
+        x += (vx * cos(th) - vy * sin(th)) * h;
+        y += (vx * sin(th) + vy * cos(th)) * h;
+    }
+    c["vx"] = vx;
+    c["vy"] = vy;
+    c["omega"] = w;
+    c["theta"] = track.wrap_angle(th);
+    c["x"] = x;
+    c["y"] = y;
+    c["steps"] += 1;
+    let spd = sqrt(vx * vx + vy * vy);
+    c["distance"] += spd * DT;
+    c["slip"] = (abs(vx) > 1.0 ? atan2(vy, abs(vx)) : 0.0);
+    c["drifting"] = (spd > 5.0 && abs(c["slip"]) > 0.25);
+}
+
+/// Keep the car body inside the road. If it pokes through an edge it is pushed back, loses most of its speed and the
+/// contact counts as a scrape (a soft wall: the run goes on, so reversing out of trouble is a real option).
+fn wall_response(c: object) -> bool {
+    let t = c["track"];
+    let i = c["idx"];
+    let lat = (c["x"] - t["px"][i]) * t["nx"][i] + (c["y"] - t["py"][i]) * t["ny"][i];
+    let phi = track.wrap_angle(c["theta"] - t["ang"][i]);
+    let extent = abs(sin(phi)) * HALF_LEN + abs(cos(phi)) * HALF_WID;
+    let room = t["half_width"] - extent;
+    c["scraped"] = false;
+    if (abs(lat) <= room) { return false; }
+    let excess = abs(lat) - room + 0.05;
+    let side = (lat > 0.0 ? 1.0 : -1.0);
+    c["x"] -= t["nx"][i] * side * excess;
+    c["y"] -= t["ny"][i] * side * excess;
+    c["vx"] = c["vx"] * 0.55;
+    c["vy"] = c["vy"] * 0.4;
+    c["omega"] = c["omega"] * 0.5;
+    c["scrapes"] += 1;
+    c["scraped"] = true;
+    return true;
+}
+
+/// Update the progress along the centre line (signed, handles the wrap-around). Returns the metres gained.
+fn advance(c: object) -> float {
+    let t = c["track"];
+    let prev = c["idx"];
+    let now = track.nearest(t, c["x"], c["y"], prev);
+    var ds = t["s"][now] - t["s"][prev];
+    if (ds > t["length"] / 2.0) { ds -= t["length"]; }
+    if (ds < -t["length"] / 2.0) { ds += t["length"]; }
+    c["idx"] = now;
+    c["progress"] += ds;
+    return ds;
+}
+
+/// Recompute the road lidar, lateral offset and heading error from the current pose.
+fn sense_road(c: object) {
+    let t = c["track"];
+    let rays = [];
+    for (a in RAY_ANGLES) { rays.push(ray_distance(t, c["x"], c["y"], c["theta"] + a)); }
+    c["rays"] = rays;
+    let i = c["idx"];
+    c["lateral"] = (c["x"] - t["px"][i]) * t["nx"][i] + (c["y"] - t["py"][i]) * t["ny"][i];
+    c["heading_err"] = track.wrap_angle(c["theta"] - t["ang"][i]);
+}
+
+fn r3(x: float) -> float { return round(x * 1000.0) / 1000.0; }
+
+/// The JSON-friendly view the web UI draws.
+fn public_view(c: object) -> object {
+    let t = c["track"];
+    return {
+        id: c["id"], x: round(c["x"] * 100.0) / 100.0, y: round(c["y"] * 100.0) / 100.0, theta: r3(c["theta"]),
+        vx: round(c["vx"] * 100.0) / 100.0, vy: round(c["vy"] * 100.0) / 100.0, omega: r3(c["omega"]), steer: r3(c["steer"]),
+        speed: round(sqrt(c["vx"] * c["vx"] + c["vy"] * c["vy"]) * 100.0) / 100.0, slip: r3(c["slip"]), drifting: c["drifting"],
+        gear: (c["vx"] < -0.3 ? "R" : "D"), progress: round(c["progress"] / t["length"] * 10000.0) / 10000.0,
+        distance: round(c["distance"] * 10.0) / 10.0, steps: c["steps"], done: c["done"], cause: c["cause"],
+        lateral: round(c["lateral"] * 100.0) / 100.0, scrapes: c["scrapes"], hits: c["hits"], scraped: c["scraped"], hit: c["hit"],
+        action: c["action"], rays: util.round_all(c["rays"], 2), car_rays: util.round_all(c["car_rays"], 2)
+    };
+}

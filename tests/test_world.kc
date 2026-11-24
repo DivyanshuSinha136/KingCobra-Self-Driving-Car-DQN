@@ -1,0 +1,129 @@
+// The multi-car world: traffic, collisions, car lidar, rewards, end conditions, respawn.
+import "../src/track.kc" as track;
+import "../src/car.kc" as car;
+import "../src/world.kc" as world;
+
+let RW = { progress: 0.1, step: -0.03, lateral: 0.03, scrape: 0.4, hit: 1.0, drift: 0.0, lap: 20.0, stuck: -3.0, wreck: -3.0 };
+
+fn pack(n: int) -> object {
+    return world.new_world(track.generate(1, 5.0, 60.0), n, 0, 8.0);
+}
+
+fn same(n: int, a: int) -> array {
+    let acts = [];
+    for (i in 0..n) { acts.push(a); }
+    return acts;
+}
+
+fn test_pack_is_spaced_out() {
+    let w = pack(4);
+    assert_eq(len(w["cars"]), 4);
+    for (i in 1..4) {
+        let a = w["cars"][i - 1];
+        let b = w["cars"][i];
+        let d = sqrt((a["x"] - b["x"]) * (a["x"] - b["x"]) + (a["y"] - b["y"]) * (a["y"] - b["y"]));
+        assert(d > 15.0 && d < 30.0);
+        assert_eq(b["id"], i);
+    }
+}
+
+fn test_every_car_gets_its_own_action() {
+    let w = pack(3);
+    // car 0 floors it, car 1 coasts, car 2 brakes: after a second they must differ accordingly
+    for (k in 0..10) { world.step(w, [4, 5, 6], RW); }
+    assert(w["cars"][0]["vx"] > w["cars"][1]["vx"]);
+    assert(w["cars"][1]["vx"] > w["cars"][2]["vx"]);
+}
+
+fn test_car_lidar_sees_the_car_ahead() {
+    let w = pack(2);                                   // car 1 starts ~22 m behind car 0
+    let behind = w["cars"][1];
+    // car 1 sees car 0 about 22 m away in one of its forward sectors (which one depends on the bend)
+    var nearest = car.RAY_RANGE;
+    for (d in behind["car_rays"]) { if (d < nearest) { nearest = d; } }
+    assert(nearest > 15.0 && nearest < 28.0);
+    // the leader has nobody in front of it; the follower is behind it, outside every sector
+    for (d in w["cars"][0]["car_rays"]) { assert_eq(d, car.RAY_RANGE); }
+    // a car to the left lands in the left sectors
+    let a = w["cars"][1];
+    let b = w["cars"][0];
+    b["x"] = a["x"] - sin(a["theta"]) * 10.0;           // 10 m to the left of car 1
+    b["y"] = a["y"] + cos(a["theta"]) * 10.0;
+    world.sense_cars(w);
+    assert(a["car_rays"][0] < 12.0);
+    assert_eq(a["car_rays"][6], car.RAY_RANGE);
+}
+
+fn test_cars_collide_and_are_separated() {
+    let w = pack(2);
+    let a = w["cars"][0];
+    let b = w["cars"][1];
+    b["x"] = a["x"] + 1.0;                             // overlap them
+    b["y"] = a["y"];
+    world.collide(w);
+    assert(a["hit"] && b["hit"]);
+    assert_eq(a["hits"], 1);
+    let d = sqrt((a["x"] - b["x"]) * (a["x"] - b["x"]) + (a["y"] - b["y"]) * (a["y"] - b["y"]));
+    assert(d >= 2.0 * world.CAR_RADIUS - 1e-6);
+    assert(a["vx"] < 8.0 && b["vx"] < 8.0);
+}
+
+fn test_hits_are_penalised() {
+    let w = pack(2);
+    w["cars"][1]["x"] = w["cars"][0]["x"] + 0.5;
+    w["cars"][1]["y"] = w["cars"][0]["y"];
+    let r = world.step(w, [4, 4], RW);
+    assert(w["cars"][0]["hit"] && w["cars"][1]["hit"]);
+    assert(r[0] < -0.5);                               // the -1.0 hit penalty outweighs a tick of progress
+}
+
+fn test_lap_ends_the_run_with_a_bonus() {
+    let t = track.generate(1, 5.0, 60.0);
+    let w = world.new_world(t, 1, 0, 8.0);
+    let c = w["cars"][0];
+    c["progress"] = t["length"] - 0.5;
+    var total = 0.0;
+    for (k in 0..10) { if (!c["done"]) { total += world.step(w, [4], RW)[0]; } }
+    assert(c["done"]);
+    assert_eq(c["cause"], "lap");
+    assert(total > 15.0);
+}
+
+fn test_standing_still_gets_you_stuck() {
+    let w = world.new_world(track.generate(1, 5.0, 60.0), 1, 0, 0.0, 1500, 10);
+    var k = 0;
+    while (!w["cars"][0]["done"] && k < 40) { world.step(w, [5], RW); k += 1; }     // coast at rest
+    assert_eq(w["cars"][0]["cause"], "stuck");
+    assert(world.all_done(w));
+}
+
+fn test_driving_backwards_ends_the_run() {
+    let w = world.new_world(track.generate(1, 5.0, 60.0), 1, 100, 0.0, 1500, 400);
+    var k = 0;
+    while (!w["cars"][0]["done"] && k < 400) { world.step(w, [6], RW); k += 1; }    // brake/reverse
+    assert_eq(w["cars"][0]["cause"], "reverse");
+}
+
+fn test_finished_cars_leave_the_traffic() {
+    let w = pack(2);
+    w["cars"][0]["done"] = true;
+    world.sense_cars(w);
+    assert_eq(w["cars"][1]["car_rays"][3], car.RAY_RANGE);       // a finished car is no obstacle
+    let r = world.step(w, [4, 4], RW);
+    assert_eq(r[0], 0.0);
+}
+
+fn test_respawn_finds_a_clear_spot() {
+    let w = pack(4);
+    w["cars"][2]["done"] = true;
+    world.respawn(w, 2, { max_steps: 1500, stuck_steps: 40 });
+    let c = w["cars"][2];
+    assert(!c["done"]);
+    assert_eq(c["id"], 2);
+    for (o in w["cars"]) {
+        if (o["id"] != 2) {
+            let d = sqrt((o["x"] - c["x"]) * (o["x"] - c["x"]) + (o["y"] - c["y"]) * (o["y"] - c["y"]));
+            assert(d > 10.0);
+        }
+    }
+}

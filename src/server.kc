@@ -1,0 +1,430 @@
+// server.kc - the dashboard backend: a small JSON API plus the static front-end in web/.
+//
+// Routing is a pure function `route(ctx, req) -> response object`; `run` is the only place that touches the socket.
+// Every drive lives in a *session* (selected with `?sid=`): one ego car plus N NPC cars. All of them - the ego car (when
+// the AI drives it) and every NPC - are controlled by the SAME network: each tick the observations of all cars go
+// through it in one batched forward pass, observation i -> action i.
+//
+//   GET  /  /static/<file>      dashboard                  GET  /api/health      liveness + uptime
+//   GET  /api/tracks            the track library          GET  /api/track?id=N  road geometry for drawing
+//   GET  /api/state             all cars + ego Q-values    GET  /api/model       model card
+//   POST /api/reset             new run (?track=&start=&npcs=)    GET  /api/metrics   training curves
+//   POST /api/ai-step           one tick, AI drives all    GET  /api/benchmark   ?group=test&starts=N  (AI vs baseline)
+//   POST /api/drive             {"steer":-1|0|1,"pedal":0..3}  one tick, a human drives the ego car
+//   POST /api/shutdown          stop the server (only with server.allow_shutdown = true)
+import std.http;
+import std.json;
+import std.io;
+import std.system;
+import "util.kc" as util;
+import "track.kc" as track;
+import "car.kc" as car;
+import "world.kc" as world;
+import "features.kc" as features;
+import "agent.kc" as agent;
+import "trainer.kc" as trainer;
+
+let VERSION = "1.0.0";
+let SID_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+let CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// A JSON response.
+fn ok(value, status: int = 200) -> object {
+    return { status: status, body: json.stringify(value), type: "application/json", stop: false, headers: [] };
+}
+
+fn fail(status: int, message: string, headers: array = []) -> object {
+    return { status: status, body: json.stringify({ error: message, status: status }), type: "application/json", stop: false, headers: headers };
+}
+
+fn content_type(name: string) -> string {
+    if (name.ends_with(".html")) { return "text/html; charset=utf-8"; }
+    if (name.ends_with(".css")) { return "text/css; charset=utf-8"; }
+    if (name.ends_with(".js")) { return "text/javascript; charset=utf-8"; }
+    if (name.ends_with(".svg")) { return "image/svg+xml"; }
+    if (name.ends_with(".json")) { return "application/json"; }
+    return "application/octet-stream";
+}
+
+/// Read every file of web/ once at start-up. Only these exact names are ever served, so there is no path to traverse.
+fn load_assets(web_dir: string) -> object {
+    let assets = {};
+    if (!system.is_dir(web_dir)) { util.fail("web directory not found: " + web_dir); }
+    for (entry in system.list_dir(web_dir)) {
+        let p = system.path_join(web_dir, entry);
+        if (system.is_file(p)) { assets[entry] = { body: io.read_file(p), type: content_type(entry) }; }
+    }
+    if (assets["index.html"] == null) { util.fail("web/index.html is missing"); }
+    return assets;
+}
+
+/// Accept only simple session ids.
+fn clean_sid(raw) -> string {
+    if (raw == null) { return "default"; }
+    let s = str(raw);
+    if (len(s) < 1 || len(s) > 40) { return "default"; }
+    for (ch in s) {
+        if (!SID_CHARS.contains(ch)) { return "default"; }
+    }
+    return s;
+}
+
+fn round3(x: float) -> float { return round(x * 1000.0) / 1000.0; }
+
+/// The track with this seed (generated once, then cached).
+fn get_track(ctx: object, seed: int) -> object {
+    let key = str(seed);
+    if (ctx["tracks"][key] == null) {
+        ctx["tracks"][key] = track.generate(seed, ctx["cfg"]["sim"]["half_width"], ctx["cfg"]["sim"]["radius"]);
+    }
+    return ctx["tracks"][key];
+}
+
+fn first_track(ctx: object) -> int {
+    return ctx["cfg"]["tracks"]["test"][0];
+}
+
+/// A fresh world: the ego car (id 0) plus `npcs` NPC cars in a pack behind it. Finished NPCs are respawned.
+fn new_run(ctx: object, seed: int, start: int, npcs: int) -> object {
+    let t = get_track(ctx, seed);
+    var s = start;
+    if (s < 0 || s >= t["n"]) { s = 0; }
+    let w = trainer.new_world(ctx["cfg"], t, 1 + npcs, s, 3.0);
+    w["respawn"] = true;
+    return w;
+}
+
+fn get_session(ctx: object, sid: string) -> object {
+    let ss = ctx["sessions"];
+    if (ss[sid] == null) {
+        if (len(keys(ss)) >= ctx["cfg"]["server"]["max_sessions"]) {
+            var oldest = "";
+            var oldest_t = 0.0;
+            for (k in keys(ss)) {
+                if (oldest == "" || ss[k]["last_used"] < oldest_t) { oldest = k; oldest_t = ss[k]["last_used"]; }
+            }
+            ss.remove(oldest);
+        }
+        let npcs = ctx["cfg"]["server"]["npcs"];
+        ss[sid] = { world: new_run(ctx, first_track(ctx), 0, npcs), npcs: npcs, model: ctx["cfg"]["train"]["name"], runs: 0, laps: 0, best_lap: null, drift_ticks: 0, last_used: system.time() };
+    }
+    ss[sid]["last_used"] = system.time();
+    return ss[sid];
+}
+
+/// Record the ego car's finished run in the session statistics (once).
+fn settle(sess: object) {
+    let c = sess["world"]["cars"][0];
+    if (c["done"] && !c["settled"]) {
+        c["settled"] = true;
+        sess["runs"] += 1;
+        if (c["cause"] == "lap") {
+            sess["laps"] += 1;
+            let lt = c["steps"] * car.DT;
+            if (sess["best_lap"] == null || lt < sess["best_lap"]) { sess["best_lap"] = round(lt * 10.0) / 10.0; }
+        }
+    }
+}
+
+/// Advance the world by one tick. Every running car's observation goes through the shared network in ONE batched call;
+/// `ego_action` (or null) overrides the ego car's choice when a human is driving. Returns the ego decision.
+fn tick(ctx: object, sess: object, ego_action) -> object {
+    let w = sess["world"];
+    let cars = w["cars"];
+    let obs = [];
+    let alive = [];
+    for (i in 0..len(cars)) {
+        if (!cars[i]["done"]) { obs.push(features.encode(cars[i])); alive.push(i); }
+    }
+    let qs = agent.q_values_batch(ctx["agents"][sess["model"]], obs);
+    let acts = [];
+    for (i in 0..len(cars)) { acts.push(4); }
+    var decision = null;
+    for (k in 0..len(alive)) {
+        let i = alive[k];
+        let a = util.argmax(qs[k]);
+        acts[i] = a;
+        if (i == 0) {
+            decision = { action: a, name: car.ACTION_NAMES[a], q: util.round_all(qs[k], 3), human: false };
+            if (ego_action != null) { acts[0] = ego_action; decision["human"] = true; decision["action"] = ego_action; decision["name"] = car.ACTION_NAMES[ego_action]; }
+        }
+    }
+    world.step(w, acts, ctx["cfg"]["reward"]);
+    if (!cars[0]["done"]) {
+        if (cars[0]["drifting"]) { sess["drift_ticks"] += 1; }
+    }
+    settle(sess);
+    // NPC traffic never runs dry: a finished NPC re-enters the road somewhere clear
+    if (w["respawn"]) {
+        for (i in 1..len(cars)) {
+            if (cars[i]["done"]) { world.respawn(w, i, ctx["cfg"]["sim"]); }
+        }
+        world.sense_cars(w);
+    }
+    return decision;
+}
+
+/// What the front-end draws: every car, plus the ego car's Q-values and the features behind them.
+fn snapshot(ctx: object, sess: object) -> object {
+    let w = sess["world"];
+    let cars = [];
+    for (c in w["cars"]) { cars.push(car.public_view(c)); }
+    let ego = w["cars"][0];
+    let feats = features.encode(ego);
+    let q = agent.q_values(ctx["agents"][sess["model"]], feats);
+    return {
+        track: w["track"]["seed"], cars: cars, npcs: sess["npcs"], model: sess["model"], time: round(ego["steps"] * car.DT * 10.0) / 10.0,
+        q: util.round_all(q, 3), best_action: util.argmax(q), features: util.round_all(feats, 3),
+        session: { runs: sess["runs"], laps: sess["laps"], best_lap: sess["best_lap"], drift_seconds: round(sess["drift_ticks"] * car.DT * 10.0) / 10.0 }
+    };
+}
+
+/// The model named by `?model=` (default: the session's / the primary one), or null if it is not loaded.
+fn model_param(ctx: object, req) -> any {
+    let raw = query_value(req, "model");
+    if (raw == null) { return ctx["cfg"]["train"]["name"]; }
+    if (ctx["agents"][str(raw)] == null) { return null; }
+    return str(raw);
+}
+
+/// A one-line description of every loaded model.
+fn model_library(ctx: object) -> array {
+    let out = [];
+    for (name in ctx["order"]) {
+        let card = ctx["cards"][name];
+        var style = "racing";
+        if (card["config"] != null && card["config"]["reward"]["drift"] > 0.0) { style = "drift"; }
+        var done = null;
+        var spd = null;
+        if (card["eval_unseen"] != null) { done = card["eval_unseen"]["completion"]; spd = card["eval_unseen"]["mean_speed"]; }
+        out.push({ name: name, style: style, unseen_completion: done, unseen_speed: spd });
+    }
+    return out;
+}
+
+fn query_value(req, name: string) -> any {
+    for (pair in http.query_parse(req.query)) { if (pair[0] == name) { return pair[1]; } }
+    return null;
+}
+
+/// Integer query parameter, or `fallback` when absent.
+fn query_int(req, name: string, fallback: int) -> int {
+    let raw = query_value(req, name);
+    if (raw == null) { return fallback; }
+    return int(raw);
+}
+
+fn read_metrics(ctx: object, name: string) -> object {
+    let p = trainer.paths(ctx["cfg"], name);
+    if (!io.exists(p["metrics"])) { return { history: [], name: name, episodes_done: 0 }; }
+    return json.parse(io.read_file(p["metrics"]));
+}
+
+fn track_library(ctx: object) -> array {
+    let out = [];
+    for (grp in ["train", "val", "test"]) {
+        for (sd in ctx["cfg"]["tracks"][grp]) {
+            out.push({ id: sd, group: grp, length: round(get_track(ctx, sd)["length"]) });
+        }
+    }
+    return out;
+}
+
+fn static_reply(a: object) -> object {
+    return { status: 200, body: a["body"], type: a["type"], stop: false, headers: ["Cache-Control: no-cache"] };
+}
+
+fn route(ctx: object, req) -> object {
+    let path = req.path;
+    let m = req.method;
+    let sid = clean_sid(query_value(req, "sid"));
+
+    // ---- static ----
+    if (path == "/" || path == "/index.html") {
+        if (m != "GET" && m != "HEAD") { return fail(405, "method not allowed", ["Allow: GET, HEAD"]); }
+        return static_reply(ctx["assets"]["index.html"]);
+    }
+    if (path.starts_with("/static/")) {
+        if (m != "GET" && m != "HEAD") { return fail(405, "method not allowed", ["Allow: GET, HEAD"]); }
+        let name = path.slice(8, len(path));
+        let a = ctx["assets"][name];
+        if (a == null || name == "index.html") { return fail(404, "no such asset"); }
+        return static_reply(a);
+    }
+    if (path == "/favicon.ico") {
+        let a = ctx["assets"]["favicon.svg"];
+        if (a == null) { return { status: 204, body: "", type: "text/plain", stop: false, headers: [] }; }
+        return static_reply(a);
+    }
+
+    // ---- API: read-only ----
+    if (path == "/api/health") {
+        if (m != "GET") { return fail(405, "method not allowed", ["Allow: GET"]); }
+        return ok({ status: "ok", version: VERSION, uptime: round3(system.monotonic() - ctx["started"]), sessions: len(keys(ctx["sessions"])) });
+    }
+    if (path == "/api/models") {
+        if (m != "GET") { return fail(405, "method not allowed", ["Allow: GET"]); }
+        return ok({ models: model_library(ctx), default: ctx["cfg"]["train"]["name"] });
+    }
+    if (path == "/api/model") {
+        if (m != "GET") { return fail(405, "method not allowed", ["Allow: GET"]); }
+        let name = model_param(ctx, req);
+        if (name == null) { return fail(404, "no such model"); }
+        return ok(ctx["cards"][name]);
+    }
+    if (path == "/api/metrics") {
+        if (m != "GET") { return fail(405, "method not allowed", ["Allow: GET"]); }
+        let name = model_param(ctx, req);
+        if (name == null) { return fail(404, "no such model"); }
+        return ok(read_metrics(ctx, name));
+    }
+    if (path == "/api/tracks") {
+        if (m != "GET") { return fail(405, "method not allowed", ["Allow: GET"]); }
+        return ok({ tracks: track_library(ctx) });
+    }
+    if (path == "/api/track") {
+        if (m != "GET") { return fail(405, "method not allowed", ["Allow: GET"]); }
+        let id = query_int(req, "id", first_track(ctx));
+        if (id < 0 || id > 99999) { return fail(400, "id must be between 0 and 99999"); }
+        return ok(track.outline(get_track(ctx, id)));
+    }
+    if (path == "/api/state") {
+        if (m != "GET") { return fail(405, "method not allowed", ["Allow: GET"]); }
+        return ok(snapshot(ctx, get_session(ctx, sid)));
+    }
+    if (path == "/api/benchmark") {
+        if (m != "GET") { return fail(405, "method not allowed", ["Allow: GET"]); }
+        var grp = query_value(req, "group");
+        if (grp == null) { grp = "test"; }
+        if (grp != "train" && grp != "val" && grp != "test") { return fail(400, "group must be train, val or test"); }
+        let starts = query_int(req, "starts", 2);
+        let cap = ctx["cfg"]["server"]["benchmark_max"];
+        if (starts < 1 || starts > cap) { return fail(400, "starts must be between 1 and " + str(cap)); }
+        let tracks = trainer.make_tracks(ctx["cfg"], ctx["cfg"]["tracks"][grp]);
+        let bm = model_param(ctx, req);
+        if (bm == null) { return fail(404, "no such model"); }
+        let ai = trainer.summarize(trainer.evaluate(ctx["agents"][bm], ctx["cfg"], tracks, starts));
+        let base = trainer.summarize(trainer.evaluate({ baseline: true }, ctx["cfg"], tracks, starts));
+        return ok({ group: grp, starts: starts, tracks: ctx["cfg"]["tracks"][grp], ai: ai, baseline: base });
+    }
+
+    // ---- API: actions ----
+    if (path == "/api/reset") {
+        if (m != "POST") { return fail(405, "method not allowed", ["Allow: POST"]); }
+        let sess = get_session(ctx, sid);
+        let id = query_int(req, "track", sess["world"]["track"]["seed"]);
+        if (id < 0 || id > 99999) { return fail(400, "track must be between 0 and 99999"); }
+        let npcs = query_int(req, "npcs", sess["npcs"]);
+        let cap = ctx["cfg"]["server"]["max_npcs"];
+        if (npcs < 0 || npcs > cap) { return fail(400, "npcs must be between 0 and " + str(cap)); }
+        let mname = model_param(ctx, req);
+        if (mname == null) { return fail(404, "no such model"); }
+        sess["model"] = mname;
+        sess["npcs"] = npcs;
+        sess["world"] = new_run(ctx, id, query_int(req, "start", 0), npcs);
+        return ok(snapshot(ctx, sess));
+    }
+    if (path == "/api/ai-step") {
+        if (m != "POST") { return fail(405, "method not allowed", ["Allow: POST"]); }
+        let sess = get_session(ctx, sid);
+        var decision = null;
+        if (!sess["world"]["cars"][0]["done"]) { decision = tick(ctx, sess, null); }
+        let view = snapshot(ctx, sess);
+        view["decision"] = decision;
+        return ok(view);
+    }
+    if (path == "/api/drive") {
+        if (m != "POST") { return fail(405, "method not allowed", ["Allow: POST"]); }
+        let body = json.try_parse(req.body, null);
+        if (body == null || typeof(body) != "object") { return fail(400, "body must be a JSON object like {\"steer\":1,\"pedal\":0}"); }
+        var steer = body["steer"];
+        var pedal = body["pedal"];
+        if (steer == null) { steer = 0; }
+        if (pedal == null) { pedal = 1; }
+        if (typeof(steer) != "int" || steer < -1 || steer > 1) { return fail(400, "steer must be -1 (right), 0 or 1 (left)"); }
+        if (typeof(pedal) != "int" || pedal < 0 || pedal > 3) { return fail(400, "pedal must be 0 (gas), 1 (coast), 2 (brake/reverse) or 3 (handbrake)"); }
+        let sess = get_session(ctx, sid);
+        var decision = null;
+        if (!sess["world"]["cars"][0]["done"]) { decision = tick(ctx, sess, (1 - steer) * 4 + pedal); }
+        let view = snapshot(ctx, sess);
+        view["decision"] = decision;
+        return ok(view);
+    }
+    if (path == "/api/shutdown") {
+        if (m != "POST") { return fail(405, "method not allowed", ["Allow: POST"]); }
+        if (!ctx["cfg"]["server"]["allow_shutdown"]) { return fail(403, "shutdown is disabled (set server.allow_shutdown=true)"); }
+        let r = ok({ ok: true });
+        r["stop"] = true;
+        return r;
+    }
+    if (path.starts_with("/api/")) { return fail(404, "no such endpoint: " + path); }
+    return fail(404, "not found");
+}
+
+/// Send a route result over the socket, with the standard security headers.
+fn send(req, r: object) {
+    let headers = ["Content-Type: " + r["type"], "X-Content-Type-Options: nosniff", "Referrer-Policy: no-referrer",
+                   "Content-Security-Policy: " + CSP];
+    if (r["type"] == "application/json") { headers.push("Cache-Control: no-store"); }
+    for (h in r["headers"]) { headers.push(h); }
+    http.respond(req, r["status"], r["body"], headers);
+}
+
+/// Load the saved models (training the primary one first if allowed) and serve until shut down.
+fn run(cfg: object, root: string, train_if_missing: bool) {
+    let primary = cfg["train"]["name"];
+    let p = trainer.paths(cfg);
+    if (!io.exists(p["model"])) {
+        if (!train_if_missing) { util.fail("no trained model at " + p["model"] + " - run `train` first"); }
+        print("no model found at " + p["model"] + " - training one first (use --no-train to disable)");
+        trainer.train(cfg, true);
+    }
+    let agents = {};
+    let cards = {};
+    let order = [primary];
+    for (n in cfg["server"]["models"]) { if (n != primary) { order.push(n); } }
+    let loaded = [];
+    for (n in order) {
+        let mp = trainer.paths(cfg, n);
+        if (io.exists(mp["model"])) {
+            agents[n] = agent.load(mp["model"], features.DIM, car.N_ACTIONS, cfg["agent"]);
+            cards[n] = { name: n, note: "model card not found" };
+            if (io.exists(mp["card"])) { cards[n] = json.parse(io.read_file(mp["card"])); }
+            loaded.push(n);
+        }
+    }
+    print("models loaded: " + loaded.join(", "));
+
+    let ctx = {
+        cfg: cfg, agents: agents, cards: cards, order: loaded, sessions: {}, tracks: {}, started: system.monotonic(),
+        assets: load_assets(system.path_join(root, "web"))
+    };
+    let s = http.listen(cfg["server"]["port"], cfg["server"]["host"]);
+    let port = http.server_port(s);
+    let portfile = system.getenv_or("KC_PORT_FILE", "");
+    if (portfile != "") { io.write_file(portfile, str(port)); }
+
+    print("");
+    print("==========================================");
+    print("  KingCobra Self-Driving Car - dashboard ready");
+    print("  ->  http://" + cfg["server"]["host"] + ":" + str(port));
+    print("==========================================");
+    print("Press Ctrl+C to stop.");
+
+    var running = true;
+    while (running) {
+        let req = http.accept(s, 1.0);
+        if (req == null) { continue; }
+        let t0 = system.monotonic();
+        var r = null;
+        try { r = route(ctx, req); }
+        catch (e) { r = fail(500, "internal error: " + e.message); }
+        send(req, r);
+        if (cfg["server"]["log"]) {
+            print(f"{req.method.pad_right(5, " ")} {req.path.pad_right(18, " ")} {r["status"]}  {util.fmt((system.monotonic() - t0) * 1000.0, 1)} ms");
+        }
+        if (r["stop"]) { running = false; }
+    }
+    http.close(s);
+    print("server stopped");
+}

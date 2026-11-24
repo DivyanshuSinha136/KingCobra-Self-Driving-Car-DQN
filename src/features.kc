@@ -1,0 +1,48 @@
+// features.kc - what the shared Q-network sees for ONE car: its lidar, its own motion and the road ahead.
+//
+//   idx   name              meaning
+//    0-6  road_*            free distance to the road edge along rays at +90, +60, +30, 0, -30, -60, -90 deg, / 40 m
+//    7-13 car_*             distance to the nearest OTHER car in each 30-degree sector around the same directions, / 40 m (1 = nobody)
+//   14    speed_fwd         forward speed in the car's own frame / V_MAX  (negative = reversing)
+//   15    speed_side        sideways speed / 10 m/s  (non-zero = the car is sliding)
+//   16    yaw_rate          rotation speed / 2 rad/s
+//   17    steer             steering angle / MAX_STEER   (+1 = full left)
+//   18    lateral           offset from the centre line / half width   (+ = left of centre)
+//   19    heading_err       angle between the car and the road, / pi
+//   20-21 curve_10m/25m     how much the road turns over the next 10 m / 25 m   (+ = left)
+//
+// Every car gets the same kind of vector, so ONE network can drive all of them.
+import "car.kc" as car;
+import "track.kc" as track;
+
+let NAMES = ["road_left_90", "road_left_60", "road_left_30", "road_ahead", "road_right_30", "road_right_60", "road_right_90",
+             "car_left_90", "car_left_60", "car_left_30", "car_ahead", "car_right_30", "car_right_60", "car_right_90",
+             "speed_fwd", "speed_side", "yaw_rate", "steer", "lateral", "heading_err", "curve_10m", "curve_25m"];
+let DIM = 22;
+
+fn clip1(x: float) -> float {
+    if (x > 1.0) { return 1.0; }
+    if (x < -1.0) { return -1.0; }
+    return x;
+}
+
+/// Encode one car's observation as DIM floats, roughly in [-1, 1].
+fn encode(c: object) -> array {
+    let t = c["track"];
+    let f = [];
+    for (d in c["rays"]) { f.push(d / car.RAY_RANGE); }
+    for (d in c["car_rays"]) { f.push(d / car.RAY_RANGE); }
+    f.push(c["vx"] / car.V_MAX);
+    f.push(clip1(c["vy"] / 10.0));
+    f.push(clip1(c["omega"] / 2.0));
+    f.push(c["steer"] / car.MAX_STEER);
+    f.push(clip1(c["lateral"] / t["half_width"]));
+    f.push(c["heading_err"] / track.PI);
+    let n = t["n"];
+    let here = t["ang"][c["idx"]];
+    for (look in car.CURV_LOOK) {
+        let j = (c["idx"] + int(look / t["ds"])) % n;
+        f.push(clip1(track.wrap_angle(t["ang"][j] - here) / track.PI * 2.0));
+    }
+    return f;
+}

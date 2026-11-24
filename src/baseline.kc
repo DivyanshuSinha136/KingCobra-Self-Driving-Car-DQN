@@ -1,0 +1,28 @@
+// baseline.kc - a hand-written driver to compare the learned agent against.
+//
+// Steering is a PD-style rule on the lateral offset, the heading error and the bend ahead; speed follows the grip
+// limit (v <= 0.85 * sqrt(mu * g / curvature)) of the sharpest bend visible in the next 25 m, and it brakes when
+// another car is close ahead. It never uses the handbrake or reverse. No learning involved.
+import "car.kc" as car;
+import "features.kc" as features;
+import "track.kc" as track;
+
+/// Pick an action (see car.kc) for one car.
+fn action(c: object) -> int {
+    let f = features.encode(c);
+    let want = -0.9 * f[18] - 1.4 * c["heading_err"] + 0.9 * f[20];
+    var si = 1;
+    if (want > 0.10) { si = 0; }
+    if (want < -0.10) { si = 2; }
+    var k = abs(f[20]) * track.PI / 2.0 / car.CURV_LOOK[0];
+    let k2 = abs(f[21]) * track.PI / 2.0 / car.CURV_LOOK[1];
+    if (k2 > k) { k = k2; }
+    if (k < 0.002) { k = 0.002; }
+    var vt = 0.85 * sqrt(car.MU * car.GRAVITY / k);
+    if (vt > car.V_MAX * 0.95) { vt = car.V_MAX * 0.95; }
+    var pedal = 1;
+    if (c["vx"] < vt - 0.8) { pedal = 0; }
+    if (c["vx"] > vt + 0.8) { pedal = 2; }
+    if (f[10] < 0.3 && c["vx"] > 3.0) { pedal = 2; }          // someone is right ahead
+    return si * 4 + pedal;
+}

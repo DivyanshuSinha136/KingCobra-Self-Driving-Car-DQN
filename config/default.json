@@ -1,0 +1,100 @@
+{
+  "seed": 42,
+  "sim": {
+    "half_width": 5.0,
+    "radius": 60.0,
+    "max_steps": 1500,
+    "stuck_steps": 40,
+    "start_speed_min": 1.0,
+    "start_speed_max": 6.0,
+    "cars": 4,
+    "eval_cars": 4,
+    "spacing": 22.0
+  },
+  "tracks": {
+    "train": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "val": [
+      51,
+      52
+    ],
+    "test": [
+      101,
+      102,
+      103
+    ]
+  },
+  "reward": {
+    "progress": 0.1,
+    "step": -0.03,
+    "lateral": 0.03,
+    "scrape": 0.4,
+    "hit": 1.0,
+    "drift": 0.0,
+    "lap": 20.0,
+    "stuck": -3.0,
+    "wreck": -3.0
+  },
+  "agent": {
+    "hidden": [
+      128,
+      128
+    ],
+    "activation": "relu",
+    "lr": 0.001,
+    "lr_final": 0.0002,
+    "gamma": 0.97,
+    "n_step": 3,
+    "loss": "huber",
+    "huber_delta": 1.0,
+    "clip_norm": 10.0,
+    "double": true,
+    "target_tau": 0.01,
+    "target_hard_every": 0
+  },
+  "replay": {
+    "capacity": 60000,
+    "batch": 64,
+    "warmup": 2000,
+    "prioritized": false,
+    "alpha": 0.6,
+    "beta_start": 0.4
+  },
+  "train": {
+    "episodes": 90,
+    "learn_every": 4,
+    "eps_start": 1.0,
+    "eps_end": 0.05,
+    "eps_decay_episodes": 40,
+    "eval_every": 10,
+    "eval_starts": 3,
+    "final_eval_starts": 2,
+    "log_every": 10,
+    "target_score": null,
+    "select": "best",
+    "out_dir": "models",
+    "name": "driver_ddqn"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8766,
+    "max_sessions": 64,
+    "benchmark_max": 6,
+    "npcs": 4,
+    "max_npcs": 7,
+    "models": [
+      "driver_ddqn",
+      "drifter_ddqn"
+    ],
+    "allow_shutdown": false,
+    "log": true
+  }
+}

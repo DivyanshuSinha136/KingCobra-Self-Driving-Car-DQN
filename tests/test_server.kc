@@ -1,0 +1,138 @@
+// The web server, end to end: boot it as a child process and talk to it over real HTTP.
+import std.system;
+import std.io;
+import std.json;
+import std.http;
+import "../src/config.kc" as config;
+import "../src/trainer.kc" as trainer;
+
+var base = "";
+var child = null;
+var tmp = "";
+
+fn boot() {
+    if (child != null) { return; }
+    tmp = system.make_temp_dir("kc_drive_srv_");
+    let c = config.defaults();
+    c["train"]["episodes"] = 2;
+    c["train"]["eval_every"] = 2;
+    c["train"]["eval_starts"] = 1;
+    c["train"]["final_eval_starts"] = 1;
+    c["train"]["log_every"] = 2;
+    c["train"]["out_dir"] = tmp;
+    c["tracks"]["train"] = [1];
+    c["sim"]["cars"] = 2;
+    c["sim"]["max_steps"] = 80;
+    c["replay"]["batch"] = 8;
+    c["replay"]["capacity"] = 256;
+    c["replay"]["warmup"] = 16;
+    c["agent"]["hidden"] = [8];
+    trainer.train(c, false);
+    let portfile = system.path_join(tmp, "port");
+    system.setenv("KC_PORT_FILE", portfile);
+    let here = system.dirname(system.script_path());
+    let main = system.path_join(here, "..", "src", "main.kc");
+    child = system.spawn([system.exe_path(), "run", main, "serve", "--out", tmp, "--port", "0", "--set", "tracks.train=[1]",
+                          "--set", "server.allow_shutdown=true", "--set", "server.log=false"], false);
+    var waited = 0;
+    while (!system.exists(portfile) && waited < 300) { system.sleep(0.05); waited += 1; }
+    assert(system.exists(portfile), "server did not start");
+    base = "http://127.0.0.1:" + io.read_file(portfile);
+}
+
+fn get(path: string) { return http.get(base + path); }
+fn post(path: string, body: string = "") { return http.post(base + path, body, ["Content-Type: application/json"]); }
+
+fn test_a_health_and_static() {
+    boot();
+    assert_eq(json.parse(get("/api/health").body)["status"], "ok");
+    let page = get("/");
+    assert_eq(page.status, 200);
+    assert(page.body.contains("Self-Driving Car DQN"));
+    assert(http.header(page, "content-security-policy").contains("script-src 'self'"));
+    assert_eq(get("/static/app.js").status, 200);
+    assert_eq(get("/static/../src/main.kc").status, 404);
+}
+
+fn test_b_track_and_library() {
+    let lib = json.parse(get("/api/tracks").body)["tracks"];
+    assert(len(lib) >= 3);
+    let t = json.parse(get("/api/track?id=101").body);
+    assert_eq(t["seed"], 101);
+    assert(len(t["left"]) > 100 && len(t["left"]) == len(t["right"]));
+    assert_eq(get("/api/track?id=999999").status, 400);
+}
+
+fn test_c_state_contract() {
+    let s = json.parse(post("/api/reset?sid=t1&npcs=3").body);
+    assert_eq(len(s["cars"]), 4);                            // ego + 3 NPCs
+    assert_eq(s["cars"][0]["id"], 0);
+    assert_eq(len(s["q"]), 12);
+    assert_eq(len(s["features"]), 22);
+    assert_eq(len(s["cars"][0]["rays"]), 7);
+    assert_eq(len(s["cars"][0]["car_rays"]), 7);
+    assert(!s["cars"][0]["done"]);
+}
+
+fn test_d_ai_step_drives_every_car_with_the_shared_network() {
+    post("/api/reset?sid=t2&npcs=3");
+    let before = json.parse(get("/api/state?sid=t2").body);
+    let s = json.parse(post("/api/ai-step?sid=t2").body);
+    assert_eq(s["cars"][0]["steps"], 1);
+    assert(s["decision"] != null);
+    assert_eq(len(s["decision"]["q"]), 12);
+    for (i in 0..4) { assert_eq(s["cars"][i]["steps"], 1); }  // every car advanced in the same tick
+    assert(s["cars"][1]["x"] != before["cars"][1]["x"]);
+}
+
+fn test_e_human_drive_and_validation() {
+    post("/api/reset?sid=t3&npcs=1");
+    let a = json.parse(post("/api/drive?sid=t3", "{\"steer\":0,\"pedal\":0}").body);       // gas
+    assert(a["cars"][0]["vx"] > 3.0);
+    assert_eq(a["decision"]["human"], true);
+    let b = json.parse(post("/api/drive?sid=t3", "{\"steer\":1,\"pedal\":3}").body);       // left + handbrake
+    assert_eq(b["cars"][0]["steps"], 2);
+    assert_eq(post("/api/drive?sid=t3", "not json").status, 400);
+    assert_eq(post("/api/drive?sid=t3", "{\"pedal\":9}").status, 400);
+    assert_eq(post("/api/drive?sid=t3", "{\"steer\":2}").status, 400);
+}
+
+fn test_f_reverse_through_the_api() {
+    post("/api/reset?sid=rev&npcs=0");
+    var s = null;
+    for (i in 0..40) { s = json.parse(post("/api/drive?sid=rev", "{\"steer\":0,\"pedal\":2}").body); }   // brake/reverse
+    assert(s["cars"][0]["vx"] < -1.0 || s["cars"][0]["done"]);
+    assert(s["cars"][0]["gear"] == "R" || s["cars"][0]["done"]);
+}
+
+fn test_g_sessions_are_isolated_and_npcs_validated() {
+    post("/api/reset?sid=aaa&npcs=2");
+    post("/api/reset?sid=bbb&npcs=0");
+    post("/api/ai-step?sid=aaa");
+    post("/api/ai-step?sid=aaa");
+    assert_eq(json.parse(get("/api/state?sid=aaa").body)["cars"][0]["steps"], 2);
+    assert_eq(json.parse(get("/api/state?sid=bbb").body)["cars"][0]["steps"], 0);
+    assert_eq(len(json.parse(get("/api/state?sid=bbb").body)["cars"]), 1);
+    assert_eq(post("/api/reset?sid=aaa&npcs=99").status, 400);
+}
+
+fn test_h_methods_model_metrics_benchmark() {
+    assert_eq(get("/api/ai-step").status, 405);
+    assert_eq(post("/api/state").status, 405);
+    assert_eq(get("/api/nope").status, 404);
+    let m = json.parse(get("/api/model").body);
+    assert_eq(m["input_dim"], 22);
+    assert_eq(len(m["features"]), 22);
+    assert(len(json.parse(get("/api/metrics").body)["history"]) >= 1);
+    let b = json.parse(get("/api/benchmark?group=train&starts=1").body);
+    assert(b["ai"]["runs"] >= 1 && b["baseline"]["runs"] >= 1);
+    assert_eq(get("/api/benchmark?group=nope").status, 400);
+    assert_eq(get("/api/benchmark?starts=0").status, 400);
+}
+
+fn test_z_shutdown() {
+    assert_eq(post("/api/shutdown").status, 200);
+    assert_eq(system.wait(child, 5.0), 0);
+    system.proc_free(child);
+    system.rmdir(tmp, true);
+}

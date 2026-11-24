@@ -1,0 +1,169 @@
+// world.kc - several cars on one track.
+//
+// Every car is an independent agent: it has its own state, its own observation and its own action - but they all
+// share ONE neural network (see agent.kc: `q_values_batch`). The world only does the physics:
+//
+//   1. every running car is driven by its action          4. every car's lidar is refreshed, including a second
+//   2. cars are pushed back inside the road (soft walls)     channel that sees the *other cars*
+//   3. cars that overlap bump each other apart            5. rewards and end conditions are evaluated per car
+//
+// A car's episode ends with cause "lap" (drove a full lap), "stuck", "reverse" (wrong way), "wrecked" (too many wall
+// scrapes) or "timeout". In training the world is over when every car is done; in the dashboard NPC cars are respawned
+// as soon as they finish, so the traffic never runs dry.
+import "util.kc" as util;
+import "track.kc" as track;
+import "car.kc" as car;
+
+let CAR_RADIUS = 1.5;
+let WRECK_SCRAPES = 14;
+
+/// Put `n` cars on the track as a pack: car i starts `spacing` metres behind car i-1, alternating 1.6 m left / right of
+/// the centre line, all at `speed` m/s. A tight pack means the cars really do have to deal with each other.
+fn new_world(t: object, n: int, base: int = 0, speed: float = 3.0, max_steps: int = 1500, stuck_steps: int = 40, spacing: float = 22.0) -> object {
+    let cars = [];
+    let gap = int(spacing / t["ds"]);
+    for (i in 0..n) {
+        let c = car.new_car(t, (base + t["n"] * 4 - i * gap) % t["n"], speed, i, max_steps, stuck_steps);
+        let side = (i % 2 == 0 ? 1.6 : -1.6);
+        c["x"] += t["nx"][c["idx"]] * side;
+        c["y"] += t["ny"][c["idx"]] * side;
+        car.sense_road(c);
+        cars.push(c);
+    }
+    let w = { track: t, cars: cars, steps: 0, respawn: false, events: [] };
+    sense_cars(w);
+    return w;
+}
+
+/// Refresh the car channel of every car. It is a 7-sector "radar", not 7 thin rays: a car 20 m away is only ~0.15 rad
+/// wide, so thin rays would miss a neighbour a few metres to the side. Each sector is 30 degrees wide, centred on the
+/// matching lidar ray, and holds the distance to the nearest other car (minus its radius) whose bearing falls inside.
+fn sense_cars(w: object) {
+    let cars = w["cars"];
+    for (me in cars) {
+        let sectors = [];
+        for (k in 0..7) { sectors.push(car.RAY_RANGE); }
+        for (o in cars) {
+            if (o["id"] != me["id"] && !o["done"]) {
+                let dx = o["x"] - me["x"];
+                let dy = o["y"] - me["y"];
+                let d2 = dx * dx + dy * dy;
+                if (d2 < car.RAY_RANGE * car.RAY_RANGE) {
+                    let bearing = track.wrap_angle(atan2(dy, dx) - me["theta"]);
+                    if (abs(bearing) <= 1.8326) {                       // within +-105 degrees
+                        var k = int(round((1.5708 - bearing) / 0.5236));
+                        if (k < 0) { k = 0; }
+                        if (k > 6) { k = 6; }
+                        var d = sqrt(d2) - CAR_RADIUS;
+                        if (d < 0.0) { d = 0.0; }
+                        if (d < sectors[k]) { sectors[k] = d; }
+                    }
+                }
+            }
+        }
+        me["car_rays"] = sectors;
+    }
+}
+
+/// Bump overlapping cars apart; both lose speed. Marks `hit` on every car involved.
+fn collide(w: object) {
+    let cars = w["cars"];
+    let n = len(cars);
+    for (i in 0..n) { cars[i]["hit"] = false; }
+    for (i in 0..n) {
+        for (j in i + 1..n) {
+            let a = cars[i];
+            let b = cars[j];
+            if (!a["done"] && !b["done"]) {
+                let dx = b["x"] - a["x"];
+                let dy = b["y"] - a["y"];
+                let d2 = dx * dx + dy * dy;
+                let lim = 2.0 * CAR_RADIUS;
+                if (d2 < lim * lim) {
+                    var d = sqrt(d2);
+                    var nx = 1.0;
+                    var ny = 0.0;
+                    if (d > 0.001) { nx = dx / d; ny = dy / d; } else { d = 0.0; }
+                    let push = (lim - d) * 0.5 + 0.02;
+                    a["x"] -= nx * push; a["y"] -= ny * push;
+                    b["x"] += nx * push; b["y"] += ny * push;
+                    a["vx"] = a["vx"] * 0.7; a["vy"] = a["vy"] * 0.7;
+                    b["vx"] = b["vx"] * 0.7; b["vy"] = b["vy"] * 0.7;
+                    a["hit"] = true; b["hit"] = true;
+                    a["hits"] += 1; b["hits"] += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Reward weights: progress, step, lateral, scrape, hit, drift, lap, stuck, wreck.
+fn step(w: object, actions: array, rw: object) -> array {
+    let cars = w["cars"];
+    let n = len(cars);
+    let rewards = [];
+    for (i in 0..n) { rewards.push(0.0); }
+    w["steps"] += 1;
+
+    for (i in 0..n) { if (!cars[i]["done"]) { car.drive(cars[i], actions[i]); } }
+    for (i in 0..n) { if (!cars[i]["done"]) { car.wall_response(cars[i]); } }
+    collide(w);
+
+    for (i in 0..n) {
+        let c = cars[i];
+        if (!c["done"]) {
+            let t = c["track"];
+            let ds = car.advance(c);
+            car.sense_road(c);
+            var r = ds * rw["progress"] + rw["step"];
+            let off = c["lateral"] / t["half_width"];
+            r -= rw["lateral"] * off * off;
+            if (c["scraped"]) { r -= rw["scrape"]; }
+            if (c["hit"]) { r -= rw["hit"]; }
+            if (c["drifting"] && abs(c["lateral"]) < t["half_width"] * 0.8) { r += rw["drift"]; }
+
+            if (c["progress"] >= t["length"]) {
+                c["done"] = true; c["cause"] = "lap"; r += rw["lap"];
+            } else if (c["scrapes"] >= WRECK_SCRAPES) {
+                c["done"] = true; c["cause"] = "wrecked"; r += rw["wreck"];
+            } else {
+                if (abs(c["vx"]) < 0.5) { c["still"] += 1; } else { c["still"] = 0; }
+                if (c["still"] > c["stuck_steps"]) {
+                    c["done"] = true; c["cause"] = "stuck"; r += rw["stuck"];
+                } else if (c["progress"] < -15.0) {
+                    c["done"] = true; c["cause"] = "reverse"; r += rw["stuck"];
+                } else if (c["steps"] >= c["max_steps"]) {
+                    c["done"] = true; c["cause"] = "timeout";
+                }
+            }
+            rewards[i] = r;
+        }
+    }
+    sense_cars(w);
+    return rewards;
+}
+
+/// True once every car has finished.
+fn all_done(w: object) -> bool {
+    for (c in w["cars"]) { if (!c["done"]) { return false; } }
+    return true;
+}
+
+/// Put a finished car back on the road at a spot at least `clear` metres from every other running car.
+fn respawn(w: object, i: int, cfg_sim: object, clear: float = 18.0) {
+    let t = w["track"];
+    var spot = util.below(t["n"]);
+    for (attempt in 0..30) {
+        let cand = util.below(t["n"]);
+        var ok = true;
+        for (o in w["cars"]) {
+            if (o["id"] != i && !o["done"]) {
+                let dx = o["x"] - t["px"][cand];
+                let dy = o["y"] - t["py"][cand];
+                if (dx * dx + dy * dy < clear * clear) { ok = false; }
+            }
+        }
+        if (ok) { spot = cand; break; }
+    }
+    w["cars"][i] = car.new_car(t, spot, 3.0, i, cfg_sim["max_steps"], cfg_sim["stuck_steps"]);
+}

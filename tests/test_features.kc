@@ -1,0 +1,41 @@
+import "../src/track.kc" as track;
+import "../src/car.kc" as car;
+import "../src/features.kc" as features;
+import "../src/world.kc" as world;
+
+fn test_dimension_and_names() {
+    let c = car.new_car(track.generate(1, 5.0, 60.0), 0, 5.0);
+    assert_eq(len(features.encode(c)), features.DIM);
+    assert_eq(len(features.NAMES), features.DIM);
+}
+
+fn test_values_are_normalised() {
+    let w = world.new_world(track.generate(2, 5.0, 60.0), 3, 0, 10.0);
+    let rw = { progress: 0.1, step: -0.03, lateral: 0.03, scrape: 0.4, hit: 1.0, drift: 0.0, lap: 20.0, stuck: -3.0, wreck: -3.0 };
+    for (k in 0..40) {
+        world.step(w, [k % 12, (k * 5) % 12, 4], rw);
+        for (c in w["cars"]) {
+            if (!c["done"]) { for (v in features.encode(c)) { assert(v >= -1.5 && v <= 1.5); } }
+        }
+    }
+}
+
+fn test_motion_features() {
+    let c = car.new_car(track.generate(1, 5.0, 60.0), 0, 11.0);
+    let f = features.encode(c);
+    assert(abs(f[14] - 11.0 / car.V_MAX) < 1e-9);       // speed_fwd
+    assert_eq(f[15], 0.0);                              // not sliding
+    c["vx"] = -3.0;
+    assert(features.encode(c)[14] < 0.0);               // reversing is visible to the network
+}
+
+fn test_car_channel_is_separate_from_road_channel() {
+    let w = world.new_world(track.generate(1, 5.0, 60.0), 2, 0, 8.0);
+    let f = features.encode(w["cars"][1]);
+    var nearest = 1.0;
+    for (k in 7..14) { if (f[k] < nearest) { nearest = f[k]; } }
+    assert(nearest < 0.8);                              // the car channel sees the leader
+    assert(f[3] > 0.3);                                 // road_ahead is unaffected by the other car
+    let alone = features.encode(w["cars"][0]);
+    for (k in 7..14) { assert_eq(alone[k], 1.0); }      // the leader sees nobody
+}

@@ -1,0 +1,147 @@
+// Car physics: acceleration, braking, reverse, grip limits, drift and the soft walls.
+import "../src/track.kc" as track;
+import "../src/car.kc" as car;
+
+let GAS = 4;          // straight + gas
+let COAST = 5;
+let BRAKE = 6;        // straight + brake/reverse
+let HAND = 7;         // straight + handbrake
+
+fn fresh(speed: float) -> object {
+    return car.new_car(track.generate(1, 5.0, 60.0), 0, speed);
+}
+
+fn drive_for(c: object, action: int, ticks: int) {
+    for (i in 0..ticks) { car.drive(c, action); }
+}
+
+fn test_action_decoding() {
+    assert_eq(len(car.ACTION_NAMES), car.N_ACTIONS);
+    assert_eq(car.steer_of(0), 1.0);        // left
+    assert_eq(car.steer_of(4), 0.0);
+    assert_eq(car.steer_of(11), -1.0);      // right
+    assert_eq(car.pedal_of(7), 3);
+    assert_eq(car.ACTION_NAMES[4], "straight + gas");
+}
+
+fn test_accelerates_to_a_sensible_top_speed() {
+    let c = fresh(0.0);
+    drive_for(c, GAS, 40);
+    assert(c["vx"] > 10.0 && c["vx"] < 16.0);          // 0 -> ~13 m/s in 4 s
+    drive_for(c, GAS, 200);
+    assert(c["vx"] > 18.0 && c["vx"] < car.V_MAX + 1.0);
+    assert(abs(c["vy"]) < 1e-6 && abs(c["omega"]) < 1e-6);   // straight stays straight
+}
+
+fn test_braking_distance() {
+    let c = fresh(20.0);
+    let d0 = c["distance"];
+    var ticks = 0;
+    while (c["vx"] > 0.5 && ticks < 100) { car.drive(c, BRAKE); ticks += 1; }
+    let dist = c["distance"] - d0;
+    assert(dist > 18.0 && dist < 35.0);                // about 25 m from 20 m/s (v^2 / 2a with a ~ 8 m/s^2)
+}
+
+fn test_reverse_gear() {
+    let c = fresh(0.0);
+    drive_for(c, BRAKE, 30);                           // brake/reverse while stopped -> reverse
+    assert(c["vx"] < -2.0);
+    assert(c["vx"] > -car.V_REVERSE - 0.1);            // but only up to the reverse speed limit
+    assert_eq(car.public_view(c)["gear"], "R");
+    drive_for(c, GAS, 40);                             // and gas takes it out of reverse
+    assert(c["vx"] > 1.0);
+    assert_eq(car.public_view(c)["gear"], "D");
+}
+
+fn test_braking_never_reverses_the_car_by_itself() {
+    let c = fresh(8.0);
+    var min_vx = 8.0;
+    for (i in 0..12) { car.drive(c, HAND); if (c["vx"] < min_vx) { min_vx = c["vx"]; } }
+    assert(min_vx >= 0.0);                             // handbrake stops the car, it does not push it backwards
+}
+
+fn world_velocity(c: object) -> array {
+    return [c["vx"] * cos(c["theta"]) - c["vy"] * sin(c["theta"]), c["vx"] * sin(c["theta"]) + c["vy"] * cos(c["theta"])];
+}
+
+fn test_tyre_grip_limits_cornering() {
+    // full lock at speed: the sideways acceleration of the velocity vector can never exceed what the tyres give (mu * g)
+    let c = fresh(18.0);
+    var worst = 0.0;
+    for (i in 0..40) {
+        let v0 = world_velocity(c);
+        car.drive(c, 1);                               // left + coast
+        let v1 = world_velocity(c);
+        let speed = sqrt(v0[0] * v0[0] + v0[1] * v0[1]);
+        let a_perp = abs(v0[0] * v1[1] - v0[1] * v1[0]) / speed / car.DT;
+        if (a_perp > worst) { worst = a_perp; }
+    }
+    assert(worst < car.MU * car.GRAVITY * 1.05);
+    assert(worst > 4.0);                               // ...but it does corner hard
+}
+
+fn test_handbrake_breaks_the_rear_loose() {
+    // same speed, same steering: with the handbrake the car slides far more than with plain coasting
+    let a = fresh(16.0);
+    let b = fresh(16.0);
+    var slip_free = 0.0;
+    var slip_brake = 0.0;
+    for (i in 0..10) {
+        car.drive(a, 1);
+        car.drive(b, 3);                               // left + handbrake
+        if (abs(a["slip"]) > slip_free) { slip_free = abs(a["slip"]); }
+        if (abs(b["slip"]) > slip_brake) { slip_brake = abs(b["slip"]); }
+    }
+    assert(slip_brake > 0.35);                         // > 20 degrees of slide
+    assert(slip_brake > 3.0 * slip_free);
+}
+
+fn test_drift_is_detected() {
+    let c = fresh(16.0);
+    var seen = false;
+    for (i in 0..15) { car.drive(c, 3); if (c["drifting"]) { seen = true; } }
+    assert(seen);
+    let calm = fresh(16.0);
+    drive_for(calm, GAS, 10);
+    assert(!calm["drifting"]);
+}
+
+fn test_steering_is_rate_limited() {
+    let c = fresh(10.0);
+    car.drive(c, 0);                                   // full left requested
+    assert(c["steer"] > 0.0 && c["steer"] < car.MAX_STEER * 0.6);
+    drive_for(c, 0, 10);
+    assert(abs(c["steer"] - car.MAX_STEER) < 1e-9);
+}
+
+fn test_soft_wall_pushes_back_and_slows() {
+    let t = track.generate(1, 5.0, 60.0);
+    let c = car.new_car(t, 10, 15.0);
+    c["x"] += t["nx"][10] * 4.5;                       // poke through the left edge
+    c["y"] += t["ny"][10] * 4.5;
+    assert(car.wall_response(c));
+    assert(c["scraped"] && c["scrapes"] == 1);
+    assert(c["vx"] < 15.0 * 0.6);
+    car.sense_road(c);
+    assert(abs(c["lateral"]) < t["half_width"]);
+    assert(!car.wall_response(c));                     // now it is inside: nothing happens
+}
+
+fn test_lidar_reads_the_road_edges() {
+    let t = track.generate(1, 5.0, 60.0);
+    let c = car.new_car(t, 0, 0.0);
+    // centred and aligned: both side rays (+-90 degrees) see about half the road width
+    assert(abs(c["rays"][0] - 5.0) < 0.6);
+    assert(abs(c["rays"][6] - 5.0) < 0.6);
+    assert(c["rays"][3] > 15.0);                       // straight ahead is far
+}
+
+fn test_progress_is_signed() {
+    let t = track.generate(1, 5.0, 60.0);
+    let c = car.new_car(t, 0, 10.0);
+    for (i in 0..10) { car.drive(c, GAS); car.advance(c); }
+    assert(c["progress"] > 10.0);
+    let r = car.new_car(t, 100, 0.0);
+    for (i in 0..30) { car.drive(r, BRAKE); car.advance(r); }
+    assert(r["progress"] < 0.0);                       // reversing loses progress
+}

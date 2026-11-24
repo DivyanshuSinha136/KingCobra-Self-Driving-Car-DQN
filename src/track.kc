@@ -1,0 +1,208 @@
+// track.kc — procedural closed-loop race tracks.
+//
+// A track is a smooth star-shaped loop r(theta) = R * (1 + sum_k a_k sin(k*theta + phi_k)), resampled to equal arc
+// length, with a constant half-width. Tracks come from their own tiny deterministic generator (an LCG), *not* from nn's
+// random generator, so "track 12" is the same road on every machine and generating tracks never disturbs the
+// training RNG stream.
+//
+// For fast sensing the road is also rasterised once into an occupancy grid (1 m cells); `on_road` is then one array
+// lookup, which is what the lidar ray-marching in car.kc is built on.
+import "util.kc" as util;
+
+let PI = 3.141592653589793;
+let TWO_PI = 6.283185307179586;
+let CELL = 1.0;
+
+/// Next uniform float in [0, 1) from a deterministic LCG state object { s }.
+fn lcg(st: object) -> float {
+    st["s"] = (st["s"] * 1103515245 + 12345) % 2147483648;
+    return st["s"] / 2147483648.0;
+}
+
+/// Wrap an angle to (-pi, pi].
+fn wrap_angle(a: float) -> float {
+    var x = a;
+    while (x > PI) { x -= TWO_PI; }
+    while (x <= -PI) { x += TWO_PI; }
+    return x;
+}
+
+/// One candidate loop sampled densely: returns [xs, ys].
+fn raw_loop(st: object, radius: float) -> array {
+    let amps = [];
+    let phases = [];
+    for (k in 2..6) {
+        amps.push((0.05 + 0.17 * lcg(st)) / (k - 1.0));
+        phases.push(TWO_PI * lcg(st));
+    }
+    let xs = [];
+    let ys = [];
+    let m = 720;
+    for (i in 0..m) {
+        let th = TWO_PI * i / m;
+        var f = 1.0;
+        for (j in 0..4) { f += amps[j] * sin((j + 2) * th + phases[j]); }
+        xs.push(radius * f * cos(th));
+        ys.push(radius * f * sin(th));
+    }
+    return [xs, ys];
+}
+
+/// Resample a closed polyline to points spaced `ds` apart (the last gap is stretched so the loop closes evenly).
+fn resample(xs: array, ys: array, ds: float) -> array {
+    let m = len(xs);
+    let cum = [0.0];
+    for (i in 1..m + 1) {
+        let a = i % m;
+        let b = i - 1;
+        cum.push(cum[i - 1] + sqrt((xs[a] - xs[b]) * (xs[a] - xs[b]) + (ys[a] - ys[b]) * (ys[a] - ys[b])));
+    }
+    let total = cum[m];
+    let n = int(total / ds);
+    let step = total / n;
+    let rx = [];
+    let ry = [];
+    var j = 0;
+    for (i in 0..n) {
+        let target = i * step;
+        while (cum[j + 1] < target) { j += 1; }
+        let seg = cum[j + 1] - cum[j];
+        var u = 0.0;
+        if (seg > 0.0) { u = (target - cum[j]) / seg; }
+        let a = j % m;
+        let b = (j + 1) % m;
+        rx.push(xs[a] + (xs[b] - xs[a]) * u);
+        ry.push(ys[a] + (ys[b] - ys[a]) * u);
+    }
+    return [rx, ry, total];
+}
+
+/// Build the track with the given seed. `half_width` is half the road width in metres, `radius` the mean loop radius.
+fn generate(seed: int, half_width: float = 6.0, radius: float = 55.0) -> object {
+    let st = { s: seed * 7919 + 17 };
+    for (b in 0..5) { lcg(st); }
+    var attempt = 0;
+    while (attempt < 200) {
+        attempt += 1;
+        let raw = raw_loop(st, radius);
+        let rs = resample(raw[0], raw[1], 2.0);
+        let px = rs[0];
+        let py = rs[1];
+        let n = len(px);
+        let ang = [];
+        for (i in 0..n) {
+            let nx = px[(i + 1) % n] - px[i];
+            let ny = py[(i + 1) % n] - py[i];
+            ang.push(atan2(ny, nx));
+        }
+        // sharpest turn: turning angle per metre; its inverse is the smallest radius of curvature
+        var worst = 0.0;
+        for (i in 0..n) {
+            let d = abs(wrap_angle(ang[(i + 1) % n] - ang[i])) / 2.0;
+            if (d > worst) { worst = d; }
+        }
+        if (worst > 0.0 && 1.0 / worst >= half_width * 3.0) {
+            return finish(seed, px, py, ang, rs[2], half_width);
+        }
+    }
+    util.fail("could not generate a track for seed " + str(seed));
+}
+
+/// Derive tangents, normals, arc lengths, curvature and the occupancy grid.
+fn finish(seed: int, px: array, py: array, ang: array, total: float, w: float) -> object {
+    let n = len(px);
+    let tx = [];
+    let ty = [];
+    let nx = [];
+    let ny = [];
+    let s = [];
+    var minx = px[0];
+    var maxx = px[0];
+    var miny = py[0];
+    var maxy = py[0];
+    for (i in 0..n) {
+        tx.push(cos(ang[i]));
+        ty.push(sin(ang[i]));
+        nx.push(-sin(ang[i]));        // left-hand normal
+        ny.push(cos(ang[i]));
+        s.push(total / n * i);
+        if (px[i] < minx) { minx = px[i]; }
+        if (px[i] > maxx) { maxx = px[i]; }
+        if (py[i] < miny) { miny = py[i]; }
+        if (py[i] > maxy) { maxy = py[i]; }
+    }
+    let margin = w + 4.0;
+    let ox = floor(minx - margin);
+    let oy = floor(miny - margin);
+    let gw = int(ceil(maxx + margin - ox)) + 1;
+    let gh = int(ceil(maxy + margin - oy)) + 1;
+    let grid = [0; gw * gh];
+    let r2 = w * w;
+    let reach = int(ceil(w)) + 1;
+    for (i in 0..n) {
+        let cx = int(floor(px[i] - ox));
+        let cy = int(floor(py[i] - oy));
+        for (yy in cy - reach..cy + reach + 1) {
+            for (xx in cx - reach..cx + reach + 1) {
+                let dx = xx + 0.5 + ox - px[i];
+                let dy = yy + 0.5 + oy - py[i];
+                if (dx * dx + dy * dy <= r2) { grid[yy * gw + xx] = 1; }
+            }
+        }
+    }
+    return {
+        seed: seed, half_width: w, n: n, ds: total / n, length: total,
+        px: px, py: py, tx: tx, ty: ty, nx: nx, ny: ny, ang: ang, s: s,
+        ox: ox, oy: oy, gw: gw, gh: gh, grid: grid
+    };
+}
+
+/// True if the point lies on the road.
+fn on_road(t: object, x: float, y: float) -> bool {
+    let ix = int(floor(x - t["ox"]));
+    let iy = int(floor(y - t["oy"]));
+    if (ix < 0 || iy < 0 || ix >= t["gw"] || iy >= t["gh"]) { return false; }
+    return t["grid"][iy * t["gw"] + ix] == 1;
+}
+
+/// Index of the centreline sample nearest to (x, y), searching +-`window` samples around `hint`.
+fn nearest(t: object, x: float, y: float, hint: int, window: int = 8) -> int {
+    let n = t["n"];
+    var best = hint;
+    var bd = 1.0e18;
+    for (k in -window..window + 1) {
+        let i = (hint + k + n * 4) % n;
+        let dx = x - t["px"][i];
+        let dy = y - t["py"][i];
+        let d = dx * dx + dy * dy;
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
+/// Brute-force nearest sample (used to place a car anywhere on the track).
+fn nearest_global(t: object, x: float, y: float) -> int {
+    var best = 0;
+    var bd = 1.0e18;
+    for (i in 0..t["n"]) {
+        let dx = x - t["px"][i];
+        let dy = y - t["py"][i];
+        let d = dx * dx + dy * dy;
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
+/// Geometry for the web front-end: centreline plus both road edges.
+fn outline(t: object) -> object {
+    let w = t["half_width"];
+    let left = [];
+    let right = [];
+    let center = [];
+    for (i in 0..t["n"]) {
+        left.push([round((t["px"][i] + t["nx"][i] * w) * 100.0) / 100.0, round((t["py"][i] + t["ny"][i] * w) * 100.0) / 100.0]);
+        right.push([round((t["px"][i] - t["nx"][i] * w) * 100.0) / 100.0, round((t["py"][i] - t["ny"][i] * w) * 100.0) / 100.0]);
+        center.push([round(t["px"][i] * 100.0) / 100.0, round(t["py"][i] * 100.0) / 100.0]);
+    }
+    return { seed: t["seed"], half_width: w, length: round(t["length"] * 10.0) / 10.0, left: left, right: right, center: center };
+}

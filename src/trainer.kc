@@ -1,0 +1,350 @@
+// trainer.kc — training loop, evaluation on seen and *unseen* tracks, and checkpointing.
+//
+// Every training episode drops the car at a random place on a random training track with a random speed, so the
+// network cannot memorise one road. The greedy policy is evaluated every few episodes on the training tracks (that
+// score picks the best checkpoint) and, at the end, on held-out test tracks it has never driven. Outputs land in
+// `train.out_dir`:
+//
+//     <name>.kcnn           best network (architecture + weights)
+//     <name>.json           model card: config, features, evaluation on train / validation / test tracks
+//     <name>.metrics.json   learning curves for the dashboard
+import std.system;
+import std.json;
+import std.io;
+import std.nn;
+import "util.kc" as util;
+import "track.kc" as track;
+import "car.kc" as car;
+import "world.kc" as world;
+import "features.kc" as features;
+import "replay.kc" as replay;
+import "agent.kc" as agent;
+import "baseline.kc" as baseline;
+
+fn if_str(cond: bool, a: string, b: string) -> string {
+    if (cond) { return a; }
+    return b;
+}
+
+/// Generate the tracks for a list of seeds.
+fn make_tracks(cfg: object, seeds: array) -> array {
+    let out = [];
+    for (sd in seeds) { out.push(track.generate(sd, cfg["sim"]["half_width"], cfg["sim"]["radius"])); }
+    return out;
+}
+
+fn new_car(cfg: object, t: object, start: int, speed: float) -> object {
+    let s = cfg["sim"];
+    return car.new_car(t, start, speed, 0, s["max_steps"], s["stuck_steps"]);
+}
+
+fn new_world(cfg: object, t: object, n: int, base: int, speed: float) -> object {
+    let s = cfg["sim"];
+    return world.new_world(t, n, base, speed, s["max_steps"], s["stuck_steps"], s["spacing"]);
+}
+
+/// The greedy actions of every running car in a world. ONE batched forward pass of the shared network serves all cars
+/// (observation i -> action i); for the hand-written baseline `ag` is { baseline: true } and each car is decided alone.
+fn choose_all(ag: object, w: object) -> array {
+    let cars = w["cars"];
+    let acts = [];
+    if (ag["baseline"] != null) {
+        for (c in cars) { acts.push(baseline.action(c)); }
+        return acts;
+    }
+    let obs = [];
+    for (c in cars) { if (!c["done"]) { obs.push(features.encode(c)); } }
+    let qs = agent.q_values_batch(ag, obs);
+    var k = 0;
+    for (c in cars) {
+        if (c["done"]) { acts.push(4); } else { acts.push(util.argmax(qs[k])); k += 1; }
+    }
+    return acts;
+}
+
+/// Drive `starts` worlds per track with the greedy policy (each with `cfg.sim.eval_cars` cars sharing the road).
+/// Returns aggregate statistics over every car, and a per-track breakdown.
+fn evaluate(ag: object, cfg: object, tracks: array, starts: int) -> object {
+    let ncars = cfg["sim"]["eval_cars"];
+    let progress = [];
+    let speeds = [];
+    let lap_times = [];
+    let per_track = [];
+    var laps = 0;
+    var wrecked = 0;
+    var stuck = 0;
+    var timeouts = 0;
+    var hits = 0;
+    var scrapes = 0;
+    var ticks = 0;
+    var drift_ticks = 0;
+    var reverse_ticks = 0;
+    var runs = 0;
+    for (t in tracks) {
+        let tp = [];
+        var tlaps = 0;
+        var truns = 0;
+        for (k in 0..starts) {
+            let w = new_world(cfg, t, ncars, int(t["n"] * k / starts), 3.0);
+            while (!world.all_done(w)) {
+                let acts = choose_all(ag, w);
+                world.step(w, acts, cfg["reward"]);
+                for (c in w["cars"]) {
+                    if (!c["done"]) {
+                        ticks += 1;
+                        if (c["drifting"]) { drift_ticks += 1; }
+                        if (c["vx"] < -0.3) { reverse_ticks += 1; }
+                    }
+                }
+            }
+            for (c in w["cars"]) {
+                var frac = c["progress"] / t["length"];
+                if (frac > 1.0) { frac = 1.0; }
+                if (frac < 0.0) { frac = 0.0; }
+                tp.push(frac);
+                progress.push(frac);
+                runs += 1;
+                truns += 1;
+                speeds.push(c["distance"] / (c["steps"] * car.DT));
+                hits += c["hits"];
+                scrapes += c["scrapes"];
+                if (c["cause"] == "lap") { laps += 1; tlaps += 1; lap_times.push(c["steps"] * car.DT); }
+                if (c["cause"] == "wrecked") { wrecked += 1; }
+                if (c["cause"] == "stuck" || c["cause"] == "reverse") { stuck += 1; }
+                if (c["cause"] == "timeout") { timeouts += 1; }
+            }
+        }
+        per_track.push({ track: t["seed"], progress: util.mean(tp), laps: tlaps, runs: truns });
+    }
+    var tk = ticks;
+    if (tk < 1) { tk = 1; }
+    return {
+        runs: runs, cars: ncars, mean_progress: util.mean(progress), completion: laps / runs, wreck_rate: wrecked / runs,
+        mean_speed: util.mean(speeds), mean_lap_time: util.mean(lap_times), hits_per_run: hits / runs, scrapes_per_run: scrapes / runs,
+        drift_share: drift_ticks / tk, reverse_share: reverse_ticks / tk, per_track: per_track,
+        outcomes: { lap: laps, wrecked: wrecked, stuck: stuck, timeout: timeouts }
+    };
+}
+
+/// Emit one (possibly truncated) n-step transition from the window `w` of [s, a, r, s2, d] steps.
+fn emit(rb: object, w: array, first: int, gamma: float) {
+    var ret = 0.0;
+    var disc = 1.0;
+    for (i in first..len(w)) {
+        ret += disc * w[i][2];
+        disc = disc * gamma;
+    }
+    let last = w[len(w) - 1];
+    replay.add(rb, w[first][0], w[first][1], ret, last[3], last[4], disc);
+}
+
+/// Atomic JSON write (temp file + rename) so a dashboard polling during training never reads half a file.
+fn write_json(path: string, value) {
+    let tmp = path + ".tmp";
+    io.write_file(tmp, json.stringify(value));
+    system.rename(tmp, path);
+}
+
+fn paths(cfg: object, model_name: any = null) -> object {
+    let dir = cfg["train"]["out_dir"];
+    var name = cfg["train"]["name"];
+    if (model_name != null) { name = model_name; }
+    return {
+        dir: dir,
+        model: system.path_join(dir, name + ".kcnn"),
+        card: system.path_join(dir, name + ".json"),
+        metrics: system.path_join(dir, name + ".metrics.json")
+    };
+}
+
+fn summarize(r: object) -> object {
+    return { runs: r["runs"], cars: r["cars"], mean_progress: r["mean_progress"], completion: r["completion"], wreck_rate: r["wreck_rate"],
+             mean_speed: r["mean_speed"], mean_lap_time: r["mean_lap_time"], hits_per_run: r["hits_per_run"], scrapes_per_run: r["scrapes_per_run"],
+             drift_share: r["drift_share"], reverse_share: r["reverse_share"], per_track: r["per_track"], outcomes: r["outcomes"] };
+}
+
+/// Run a full training session. Returns { agent, history, card }.
+fn train(cfg: object, verbose: bool = true) -> object {
+    let tc = cfg["train"];
+    let ac = cfg["agent"];
+    let rc = cfg["replay"];
+    let sc = cfg["sim"];
+    let p = paths(cfg);
+    util.ensure_dir(p["dir"]);
+
+    nn.seed(cfg["seed"]);
+    let train_tracks = make_tracks(cfg, cfg["tracks"]["train"]);
+    let val_tracks = make_tracks(cfg, cfg["tracks"]["val"]);
+    let test_tracks = make_tracks(cfg, cfg["tracks"]["test"]);
+    let ag = agent.create(features.DIM, car.N_ACTIONS, ac);
+    let rb = replay.create(rc["capacity"], rc["prioritized"], rc["alpha"]);
+    let n_step = ac["n_step"];
+    let gamma = ac["gamma"];
+
+    if (verbose) {
+        print("== KingCobra Self-Driving Car: training ==");
+        print(f"tracks: {len(train_tracks)} train / {len(val_tracks)} validation / {len(test_tracks)} test   network {ag["sizes"]} ({agent.param_count(ag)} parameters)   seed {cfg["seed"]}");
+        print(f"algorithm: {if_str(ac["double"], "Double DQN", "DQN")}, {n_step}-step returns, {ac["loss"]} loss, {if_str(rc["prioritized"], "prioritised", "uniform")} replay ({rc["capacity"]}), batch {rc["batch"]}, {car.N_ACTIONS} actions");
+        print(f"{sc["cars"]} cars per world drive with ONE shared network and ONE shared replay buffer (parameter sharing)");
+        print("");
+    }
+
+    let history = [];
+    let progress_hist = [];
+    let returns = [];
+    let losses = [];
+    var total_steps = 0;
+    var best_eval = -1.0;
+    var best_episode = 0;
+    var good_evals = 0;
+    var last_eval = null;
+    var episodes_done = 0;
+    let t0 = system.monotonic();
+    var chunk_t = t0;
+    var chunk_steps = 0;
+    var pending = 0;
+
+    for (ep in 1..tc["episodes"] + 1) {
+        var eps = tc["eps_start"] - (tc["eps_start"] - tc["eps_end"]) * (ep - 1) / tc["eps_decay_episodes"];
+        if (eps < tc["eps_end"]) { eps = tc["eps_end"]; }
+        if (tc["episodes"] > 1) {
+            nn.set_lr(ag["opt"], ac["lr"] + (ac["lr_final"] - ac["lr"]) * (ep - 1) / (tc["episodes"] - 1));
+        }
+        let beta = rc["beta_start"] + (1.0 - rc["beta_start"]) * (ep - 1) / tc["episodes"];
+
+        // one world with several cars; they all share the single network and the single replay buffer
+        let t = train_tracks[util.below(len(train_tracks))];
+        let speed = sc["start_speed_min"] + (sc["start_speed_max"] - sc["start_speed_min"]) * util.rnd();
+        let w = new_world(cfg, t, sc["cars"], util.below(t["n"]), speed);
+        let ncars = len(w["cars"]);
+        let windows = [];
+        let ep_returns = [];
+        for (i in 0..ncars) { windows.push([]); ep_returns.push(0.0); }
+        while (!world.all_done(w)) {
+            // observation i -> (shared network) -> action i, for every running car, in one forward pass
+            let obs = [];
+            let alive = [];
+            for (i in 0..ncars) {
+                if (!w["cars"][i]["done"]) { obs.push(features.encode(w["cars"][i])); alive.push(i); }
+            }
+            let picked = agent.act_batch(ag, obs, eps);
+            let acts = [];
+            for (i in 0..ncars) { acts.push(4); }
+            for (k in 0..len(alive)) { acts[alive[k]] = picked[k]; }
+            let rewards = world.step(w, acts, cfg["reward"]);
+
+            for (k in 0..len(alive)) {
+                let i = alive[k];
+                let c = w["cars"][i];
+                var terminal = 0;
+                if (c["done"] && c["cause"] != "timeout") { terminal = 1; }
+                let s2 = features.encode(c);
+                windows[i].push([obs[k], acts[i], rewards[i], s2, terminal]);
+                if (len(windows[i]) == n_step) {
+                    emit(rb, windows[i], 0, gamma);
+                    windows[i].remove(0);
+                }
+                if (c["done"]) {
+                    for (j in 0..len(windows[i])) { emit(rb, windows[i], j, gamma); }
+                    windows[i] = [];
+                }
+                ep_returns[i] += rewards[i];
+                total_steps += 1;
+                chunk_steps += 1;
+                pending += 1;
+            }
+
+            // learn: one gradient step for every `learn_every` collected transitions
+            while (pending >= tc["learn_every"]) {
+                pending -= tc["learn_every"];
+                if (replay.size(rb) >= rc["warmup"]) {
+                    let batch = replay.sample(rb, rc["batch"], beta);
+                    let res = agent.learn(ag, batch);
+                    replay.update_priorities(rb, batch["idx"], res["td"]);
+                    losses.push(res["loss"]);
+                    if (len(losses) > 500) { losses.remove(0); }
+                }
+            }
+        }
+        for (i in 0..ncars) {
+            var frac = w["cars"][i]["progress"] / t["length"];
+            if (frac > 1.0) { frac = 1.0; }
+            if (frac < 0.0) { frac = 0.0; }
+            progress_hist.push(frac);
+            returns.push(ep_returns[i]);
+        }
+        episodes_done = ep;
+
+        var did_eval = false;
+        if (ep % tc["eval_every"] == 0 || ep == tc["episodes"]) {
+            last_eval = evaluate(ag, cfg, val_tracks, tc["eval_starts"]);
+            did_eval = true;
+            let score = last_eval["mean_progress"] + 0.5 * last_eval["completion"] + 0.1 * last_eval["mean_speed"] / car.V_MAX;
+            if (score > best_eval) {
+                best_eval = score;
+                best_episode = ep;
+                agent.save(ag, p["model"]);
+            }
+            if (tc["target_score"] != null && score >= tc["target_score"]) { good_evals += 1; } else { good_evals = 0; }
+        }
+
+        if (ep % tc["log_every"] == 0 || did_eval || ep == tc["episodes"]) {
+            let now = system.monotonic();
+            var sps = 0.0;
+            if (now > chunk_t) { sps = chunk_steps / (now - chunk_t); }
+            var evp = null;
+            var evc = null;
+            if (did_eval) { evp = last_eval["mean_progress"]; evc = last_eval["completion"]; }
+            let row = {
+                episode: ep, steps: total_steps, epsilon: eps,
+                train_progress: util.tail_mean(progress_hist, 50), train_return: util.tail_mean(returns, 50),
+                loss: util.tail_mean(losses, 100), eval_progress: evp, eval_completion: evc,
+                seconds: now - t0, steps_per_sec: sps
+            };
+            history.push(row);
+            if (verbose) {
+                var line = f"ep {str(ep).pad_left(4, " ")}/{tc["episodes"]} | eps {util.fmt(eps)} | progress {util.fmt(row["train_progress"] * 100.0, 0).pad_left(3, " ")}% | return {util.fmt(row["train_return"], 1).pad_left(6, " ")} | loss {util.fmt(row["loss"], 4)} | {util.fmt(sps, 0).pad_left(5, " ")} steps/s";
+                if (did_eval) {
+                    line += f" | EVAL {util.fmt(evp * 100.0, 0)}% laps {util.fmt(evc * 100.0, 0)}%";
+                    if (ep == best_episode) { line += "  * best"; }
+                }
+                print(line);
+            }
+            chunk_t = now;
+            chunk_steps = 0;
+            write_json(p["metrics"], { history: history, name: tc["name"], episodes_done: ep });
+        }
+        if (good_evals >= 2) {
+            if (verbose) { print(f"target score reached twice in a row; stopping early at episode {ep}"); }
+            break;
+        }
+    }
+
+    // reload the best checkpoint (or keep the final network when train.select = "last") and measure it on seen AND unseen tracks
+    if (tc["select"] == "last") { agent.save(ag, p["model"]); best_episode = episodes_done; }
+    var best = ag;
+    if (io.exists(p["model"])) { best = agent.load(p["model"], features.DIM, car.N_ACTIONS, ac); }
+    if (verbose) { print(""); print(f"{if_str(tc["select"] == "last", "final network", "best checkpoint")}: episode {best_episode}; final evaluation ({tc["final_eval_starts"]} starts per track)..."); }
+    let seen = evaluate(best, cfg, train_tracks, tc["final_eval_starts"]);
+    let valid = evaluate(best, cfg, val_tracks, tc["final_eval_starts"]);
+    let unseen = evaluate(best, cfg, test_tracks, tc["final_eval_starts"]);
+    let seconds = system.monotonic() - t0;
+
+    let shared_cfg = json.parse(json.stringify(cfg));
+    shared_cfg["train"]["out_dir"] = "models";
+    let card = {
+        name: tc["name"], algorithm: if_str(ac["double"], "Double DQN", "DQN"), version: 1,
+        trained_at: system.time(), train_seconds: seconds, episodes: episodes_done, total_steps: total_steps,
+        seed: cfg["seed"], input_dim: features.DIM, features: features.NAMES, network: ag["sizes"],
+        parameters: agent.param_count(ag), actions: car.ACTION_NAMES, best_episode: best_episode, best_eval_score: best_eval,
+        train_tracks: cfg["tracks"]["train"], val_tracks: cfg["tracks"]["val"], test_tracks: cfg["tracks"]["test"],
+        eval_seen: summarize(seen), eval_val: summarize(valid), eval_unseen: summarize(unseen), config: shared_cfg
+    };
+    write_json(p["card"], card);
+    if (verbose) {
+        print(f"train tracks:  {util.fmt(seen["mean_progress"] * 100.0, 1)}% progress, {util.fmt(seen["completion"] * 100.0, 0)}% laps, {util.fmt(seen["mean_speed"], 1)} m/s, {util.fmt(seen["hits_per_run"], 2)} car contacts/run");
+        print(f"test tracks:   {util.fmt(unseen["mean_progress"] * 100.0, 1)}% progress, {util.fmt(unseen["completion"] * 100.0, 0)}% laps, {util.fmt(unseen["mean_speed"], 1)} m/s, {util.fmt(unseen["hits_per_run"], 2)} car contacts/run   ({util.fmt(seconds, 1)} s)");
+        print(f"saved: {p["model"]}");
+    }
+    return { agent: best, history: history, card: card };
+}

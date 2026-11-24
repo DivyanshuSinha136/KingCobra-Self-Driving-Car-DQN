@@ -1,0 +1,51 @@
+import std.system;
+import std.io;
+import std.json;
+import "../src/config.kc" as config;
+
+fn test_defaults_validate() {
+    config.validate(config.defaults());
+}
+
+fn test_set_path_converts_types() {
+    let c = config.defaults();
+    config.set_path(c, "train.episodes", "12");
+    config.set_path(c, "agent.lr", "0.5");
+    config.set_path(c, "agent.double", "false");
+    config.set_path(c, "agent.hidden", "[8, 8]");
+    config.set_path(c, "train.name", "abc");
+    assert_eq(c["train"]["episodes"], 12);
+    assert_eq(c["agent"]["lr"], 0.5);
+    assert_eq(c["agent"]["double"], false);
+    assert_eq(c["agent"]["hidden"], [8, 8]);
+    assert_eq(c["train"]["name"], "abc");
+}
+
+fn test_unknown_keys_are_errors() {
+    var msg = "";
+    try { config.set_path(config.defaults(), "train.episodez", "1"); } catch (e) { msg = e.message; }
+    assert(msg.contains("unknown config key"));
+    msg = "";
+    try { config.merge(config.defaults(), { agent: { lrr: 1 } }); } catch (e) { msg = e.message; }
+    assert(msg.contains("agent.lrr"));
+}
+
+fn test_validation_rejects_nonsense() {
+    var c = config.defaults();
+    c["agent"]["gamma"] = 1.5;
+    var msg = "";
+    try { config.validate(c); } catch (e) { msg = e.message; }
+    assert(msg.contains("gamma"));
+    c = config.defaults();
+    c["sim"]["cars"] = 99;
+    msg = "";
+    try { config.validate(c); } catch (e) { msg = e.message; }
+    assert(msg.contains("sim.cars"));
+}
+
+fn test_default_json_matches_the_built_in_defaults() {
+    // config/default.json is documentation people copy from: it must never drift from defaults()
+    let here = system.dirname(system.script_path());
+    let file = json.parse(io.read_file(system.path_join(here, "..", "config", "default.json")));
+    assert_eq(json.stringify(file), json.stringify(config.defaults()));
+}

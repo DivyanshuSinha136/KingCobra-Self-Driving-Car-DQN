@@ -1,0 +1,164 @@
+// main.kc - command-line entry point.
+//
+//   kingcobra run src/main.kc <command> [options]
+//
+//   train    Train an agent and write the model + metrics to models/
+//   eval     Drive greedy laps with a saved model on seen and unseen tracks and print statistics
+//   serve    Start the web dashboard (trains first if there is no model yet)
+//   info     Show the model card of the saved model
+//
+// Options (all commands):  --config FILE   --set key.path=value (repeatable)   --seed N   --out DIR   --name NAME
+// train:   --episodes N          eval: --starts N          serve: --port N   --host H   --no-train
+import std.system;
+import std.json;
+import std.io;
+import "util.kc" as util;
+import "config.kc" as config;
+import "track.kc" as track;
+import "car.kc" as car;
+import "features.kc" as features;
+import "agent.kc" as agent;
+import "trainer.kc" as trainer;
+import "server.kc" as server;
+
+let USAGE = "KingCobra Self-Driving Car - a Double DQN agent that learns to drive, with a live web dashboard
+
+usage: kingcobra run src/main.kc <command> [options]
+
+commands:
+  train    train an agent; writes <out>/<name>.kcnn, .json and .metrics.json
+  eval     drive greedy laps on seen and unseen tracks and print statistics
+  serve    serve the web dashboard (trains first if no model exists)
+  info     print the model card of the saved model
+
+options:
+  --config FILE      JSON file overriding config/default.json values
+  --set a.b=value    override one value, e.g. --set agent.n_step=1 (repeatable)
+  --seed N           random seed            --episodes N   training episodes
+  --starts N         eval: start positions per track      --baseline   eval: the hand-written driver
+  --out DIR          model directory        --name NAME    model name
+  --port N --host H  server address         --no-train     serve: fail instead of training when no model exists
+  -h, --help         this text";
+
+/// Parse argv (without the script name) into { command, flags, sets }.
+fn parse_args(args: array) -> object {
+    var command = "";
+    let flags = {};
+    let sets = [];
+    var i = 0;
+    while (i < len(args)) {
+        let a = args[i];
+        if (a == "-h" || a == "--help") { flags["help"] = "1"; }
+        else if (a == "--no-train") { flags["no-train"] = "1"; }
+        else if (a == "--baseline") { flags["baseline"] = "1"; }
+        else if (a.starts_with("--")) {
+            if (i + 1 >= len(args)) { util.fail("option " + a + " needs a value"); }
+            let v = args[i + 1];
+            if (a == "--set") { sets.push(v); }
+            else { flags[a.slice(2, len(a))] = v; }
+            i += 1;
+        } else if (command == "") { command = a; }
+        else { util.fail("unexpected argument '" + a + "'"); }
+        i += 1;
+    }
+    return { command: command, flags: flags, sets: sets };
+}
+
+fn flag(o: object, name: string) -> any {
+    for (k in keys(o["flags"])) { if (k == name) { return o["flags"][k]; } }
+    return null;
+}
+
+/// Where the repository root is (the parent of src/), so the default paths work from any directory.
+fn repo_root() -> string {
+    return system.path_join(system.dirname(system.script_path()), "..");
+}
+
+/// Build the effective configuration from defaults, --config, --set and the shortcut flags.
+fn build_config(o: object) -> object {
+    let root = repo_root();
+    var path = "";
+    if (flag(o, "config") != null) { path = flag(o, "config"); }
+    else {
+        let def = system.path_join(root, "config", "default.json");
+        if (io.exists(def)) { path = def; }
+    }
+    let cfg = config.load(path);
+    for (s in o["sets"]) {
+        let eq = s.index_of("=");
+        if (eq < 1) { util.fail("--set expects key.path=value, got '" + s + "'"); }
+        config.set_path(cfg, s.slice(0, eq), s.slice(eq + 1, len(s)));
+    }
+    if (flag(o, "seed") != null) { cfg["seed"] = int(flag(o, "seed")); }
+    if (flag(o, "name") != null) { cfg["train"]["name"] = flag(o, "name"); }
+    if (flag(o, "out") != null) { cfg["train"]["out_dir"] = flag(o, "out"); }
+    else if (!system.is_absolute(cfg["train"]["out_dir"])) { cfg["train"]["out_dir"] = system.path_join(root, cfg["train"]["out_dir"]); }
+    if (flag(o, "port") != null) { cfg["server"]["port"] = int(flag(o, "port")); }
+    if (flag(o, "host") != null) { cfg["server"]["host"] = flag(o, "host"); }
+    config.validate(cfg);
+    return cfg;
+}
+
+fn load_model(cfg: object) -> object {
+    let p = trainer.paths(cfg);
+    if (!io.exists(p["model"])) { util.fail("no trained model at " + p["model"] + " - run `train` first"); }
+    return agent.load(p["model"], features.DIM, car.N_ACTIONS, cfg["agent"]);
+}
+
+fn cmd_train(cfg: object, o: object) {
+    if (flag(o, "episodes") != null) { cfg["train"]["episodes"] = int(flag(o, "episodes")); }
+    config.validate(cfg);
+    trainer.train(cfg, true);
+}
+
+fn show_eval(title: string, r: object) {
+    print(f"{title}: {r["runs"]} laps");
+    print(f"  mean progress   {util.fmt(r["mean_progress"] * 100.0, 1)} %");
+    print(f"  laps completed  {util.fmt(r["completion"] * 100.0, 0)} %   (wrecked {util.fmt(r["wreck_rate"] * 100.0, 0)} %)");
+    print(f"  car contacts    {util.fmt(r["hits_per_run"], 2)} per run    wall scrapes {util.fmt(r["scrapes_per_run"], 1)} per run");
+    print(f"  drifting        {util.fmt(r["drift_share"] * 100.0, 1)} % of the time    reversing {util.fmt(r["reverse_share"] * 100.0, 1)} %");
+    print(f"  mean speed      {util.fmt(r["mean_speed"], 1)} m/s    mean lap time {util.fmt(r["mean_lap_time"], 1)} s");
+}
+
+fn cmd_eval(cfg: object, o: object) {
+    var starts = 4;
+    if (flag(o, "starts") != null) { starts = int(flag(o, "starts")); }
+    var ag = { baseline: true };
+    if (flag(o, "baseline") == null) { ag = load_model(cfg); } else { print("(hand-written baseline driver, no learning)"); }
+    show_eval("train tracks " + str(cfg["tracks"]["train"]), trainer.evaluate(ag, cfg, trainer.make_tracks(cfg, cfg["tracks"]["train"]), starts));
+    show_eval("unseen test tracks " + str(cfg["tracks"]["test"]), trainer.evaluate(ag, cfg, trainer.make_tracks(cfg, cfg["tracks"]["test"]), starts));
+}
+
+fn cmd_info(cfg: object) {
+    let p = trainer.paths(cfg);
+    if (!io.exists(p["card"])) { util.fail("no model card at " + p["card"]); }
+    let c = json.parse(io.read_file(p["card"]));
+    print(f"{c["name"]} - {c["algorithm"]}");
+    print(f"  network {c["network"]}   {c["parameters"]} parameters   {len(c["actions"])} actions");
+    print(f"  trained {c["episodes"]} episodes / {c["total_steps"]} steps in {util.fmt(c["train_seconds"], 1)} s (seed {c["seed"]})");
+    print(f"  best checkpoint: episode {c["best_episode"]}");
+    let a = c["eval_seen"];
+    let u = c["eval_unseen"];
+    print(f"  seen tracks:   {util.fmt(a["mean_progress"] * 100.0, 1)}% progress, {util.fmt(a["completion"] * 100.0, 0)}% laps");
+    print(f"  unseen tracks: {util.fmt(u["mean_progress"] * 100.0, 1)}% progress, {util.fmt(u["completion"] * 100.0, 0)}% laps");
+}
+
+fn main(argv) -> int {
+    var o = null;
+    try { o = parse_args(argv.slice(1, len(argv))); }
+    catch (e) { print("error: " + e.message); print(""); print(USAGE); return 2; }
+    if (flag(o, "help") != null || o["command"] == "") { print(USAGE); return 0; }
+    try {
+        let cfg = build_config(o);
+        let cmd = o["command"];
+        if (cmd == "train") { cmd_train(cfg, o); }
+        else if (cmd == "eval") { cmd_eval(cfg, o); }
+        else if (cmd == "info") { cmd_info(cfg); }
+        else if (cmd == "serve") { server.run(cfg, repo_root(), flag(o, "no-train") == null); }
+        else { util.fail("unknown command '" + cmd + "'"); }
+    } catch (e) {
+        print("error: " + e.message);
+        return 1;
+    }
+    return 0;
+}

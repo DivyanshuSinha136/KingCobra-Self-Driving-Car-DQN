@@ -1,0 +1,60 @@
+// Tracks: deterministic, closed, wide enough to drive, and the occupancy grid agrees with the geometry.
+import "../src/track.kc" as track;
+
+fn test_same_seed_same_road() {
+    let a = track.generate(7);
+    let b = track.generate(7);
+    assert_eq(a["length"], b["length"]);
+    assert_eq(a["px"][10], b["px"][10]);
+    assert(track.generate(8)["length"] != a["length"]);
+}
+
+fn test_loop_is_closed_and_evenly_sampled() {
+    let t = track.generate(3);
+    let n = t["n"];
+    for (i in 0..n) {
+        let dx = t["px"][(i + 1) % n] - t["px"][i];
+        let dy = t["py"][(i + 1) % n] - t["py"][i];
+        let d = sqrt(dx * dx + dy * dy);
+        assert(d > 1.5 && d < 2.5);
+    }
+    assert(abs(t["s"][n - 1] + t["ds"] - t["length"]) < 1e-6);
+}
+
+fn test_bends_are_drivable() {
+    for (seed in [1, 2, 3, 4, 5, 6, 7, 8, 51, 52, 101, 102, 103]) {
+        let t = track.generate(seed, 5.0, 60.0);
+        var worst = 0.0;
+        for (i in 0..t["n"]) {
+            let d = abs(track.wrap_angle(t["ang"][(i + 1) % t["n"]] - t["ang"][i])) / t["ds"];
+            if (d > worst) { worst = d; }
+        }
+        assert(1.0 / worst >= 15.0);            // never tighter than 15 m radius
+    }
+}
+
+fn test_grid_matches_geometry() {
+    let t = track.generate(2);
+    for (i in [0, 25, 60, 100, 150]) {
+        let x = t["px"][i];
+        let y = t["py"][i];
+        assert(track.on_road(t, x, y));
+        assert(track.on_road(t, x + t["nx"][i] * 4.0, y + t["ny"][i] * 4.0));          // inside the left edge
+        assert(track.on_road(t, x - t["nx"][i] * 4.0, y - t["ny"][i] * 4.0));          // inside the right edge
+        assert(!track.on_road(t, x + t["nx"][i] * 7.5, y + t["ny"][i] * 7.5));         // beyond it
+    }
+    assert(!track.on_road(t, 1.0e6, 1.0e6));
+}
+
+fn test_nearest_follows_the_car() {
+    let t = track.generate(4);
+    for (i in [3, 40, 99, 170]) {
+        assert_eq(track.nearest(t, t["px"][i] + 0.3, t["py"][i], i), i);
+        assert_eq(track.nearest_global(t, t["px"][i], t["py"][i]), i);
+    }
+}
+
+fn test_wrap_angle() {
+    assert(abs(track.wrap_angle(3.0 * track.PI) - track.PI) < 1e-9);
+    assert(abs(track.wrap_angle(-3.5)) < track.PI);
+}
